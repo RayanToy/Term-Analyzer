@@ -421,14 +421,3 @@ python config.py
 Все предупреждения `⚠` указывают на отсутствующие файлы или директории.
 
 ---
-
-## Лицензия
-
-MIT License
-
----
-
-## Благодарности
-
-- [Natasha](https://github.com/natasha/natasha) — библиотека для русского NLP
-- [pymorphy3](https://github.com/no-plagiarism/pymorphy3) — форк pymorphy2 с поддержкой Python 3.10+
