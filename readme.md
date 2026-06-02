@@ -24,32 +24,31 @@
 
 **Особенность реализации:** двухслойная лемматизация (Natasha для скорости + pymorphy3 для коррекции кратких форм и видов глаголов).
 
----
-
 ## 📁 Структура проекта
+
+```text
 biology-term-analyzer/
-├── config.py # Конфигурация (пути, параметры)
-├── main.py # Точка входа
+├── config.py                      # Конфигурация (пути, параметры)
+├── main.py                        # Точка входа
 ├── requirements.txt
 ├── README.md
 │
 ├── src/
-│ ├── patch_pkg_resources.py # Патч совместимости pymorphy2
-│ ├── utils.py # Вспомогательные функции
-│ ├── preprocessing.py # Очистка и лемматизация
-│ ├── analyzer.py # Поиск паттернов, подсчёт
-│ └── highlighter.py # Подсветка в .docx
+│   ├── patch_pkg_resources.py    # Патч совместимости pymorphy2
+│   ├── utils.py                   # Вспомогательные функции
+│   ├── preprocessing.py           # Очистка и лемматизация
+│   ├── analyzer.py                # Поиск паттернов, подсчёт
+│   └── highlighter.py             # Подсветка в .docx
 │
 ├── data/
-│ ├── russian_stopwords.txt # Стоп-слова (расширенный список)
-│ └── replacements.txt # Нормализация синонимов
+│   ├── russian_stopwords.txt      # Стоп-слова (расширенный список)
+│   └── replacements.txt           # Нормализация синонимов
 │
-├── textbooks/ # .docx файлы корпуса (не в репозитории)
-└── output/ # Результаты (генерируется автоматически)
-├── term_dynamics.xlsx # Сводная таблица
-├── annotated_textbooks/ # .docx с подсветкой
-└── context_logs/ # CSV с контекстами
-
+├── textbooks/                     # .docx файлы корпуса (не в репозитории)
+└── output/                        # Результаты (генерируется автоматически)
+    ├── term_dynamics.xlsx         # Сводная таблица
+    ├── annotated_textbooks/       # .docx с подсветкой
+    └── context_logs/              # CSV с контекстами
 ---
 
 ## 🚀 Быстрый старт
