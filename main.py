@@ -1,410 +1,228 @@
+# -*- coding: utf-8 -*-
+"""Поиск единиц культурного кода в учебниках истории.
+
+Примеры:
+
+    python main.py                                   # оба бэкенда, все учебники
+    python main.py --lemmatizer pymorphy             # только pymorphy3
+    python main.py --only 05_01 --no-highlight       # быстрый прогон одного учебника
+    python main.py --debug-unit "Крейсер «Аврора»"   # как разбирается наименование
 """
-Точка входа: запуск полного пайплайна анализа терминов.
 
-Что делает:
-    1. Читает словарь терминов из xlsx
-    2. Нормализует каждый термин -> паттерн лемм
-    3. Для каждого класса (5-11):
-        a. Читает текст учебника из docx
-        b. Считает вхождения всех паттернов
-        c. Вычисляет нормированную частоту
-        d. Сохраняет контексты найденных терминов в CSV
-        e. Создаёт копию учебника с подсвеченными терминами
-    4. Сохраняет сводную таблицу динамики в xlsx
-
-Запуск:
-    python main.py
-
-Для отладки отдельного термина:
-    python main.py --debug-term "яйцеклетка"
-"""
+from __future__ import annotations
 
 import argparse
-import os
-from collections import defaultdict
+import sys
+import time
 from pathlib import Path
 
-import pandas as pd
-from docx import Document
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
-from config import (
-    DICT_PATH,
-    GRADE_DOCX,
-    GRADES,
-    OUT_XLSX,
-    OUT_BOOKS_DIR,
-    LOG_DIR,
-    FALLBACK_TOTALS,
-    STOPWORDS_PATH,
-    REPLACEMENTS_PATH,
-    ALLOW_PUNCT_BETWEEN,
-    DISALLOW_HYPHEN_ADJACENT_FOR_UNIGRAMS,
-    CONTEXT_WINDOW,
-    MAX_CONTEXTS_PER_TERM,
-    DEBUG_ALL_TERMS,
-    DEBUG_TERMS,
-    NORM_PER,
-)
-from src.preprocessing import TextPreprocessorWithoutStopwords
-from src.analyzer import (
-    tokens_with_punct,
-    normalize_term_to_pattern,
-    count_patterns_strict,
-    write_context_logs,
-    debug_term_in_text,
-)
-from src.highlighter import annotate_docx
+from src import analyzer, pdfsource, pipeline, report
+from src.lemmatizers import get_backend
+from src.units import build_variants, load_units
 
 
-# =============================================================================
-# Вспомогательные функции
-# =============================================================================
-
-def read_dict_terms(dict_path: str | Path) -> pd.DataFrame:
-    """
-    Читает словарь терминов из xlsx-файла.
-
-    Ожидаемый формат: один столбец без заголовка,
-    каждая строка — один термин.
-
-    Args:
-        dict_path: путь к файлу словаря
-
-    Returns:
-        DataFrame со столбцом 'Термин', дубликаты удалены
-    """
-    df = pd.read_excel(str(dict_path), header=None, engine="openpyxl")
-    df = df.iloc[:, [0]].copy()
-    df.columns = ['Термин']
-    df['Термин'] = df['Термин'].astype(str).str.strip()
-    df = df[df['Термин'].ne('') & df['Термин'].ne('nan')]
-    df = df.drop_duplicates(subset=['Термин']).reset_index(drop=True)
-    return df
-
-
-def docx_to_text(docx_path: str | Path) -> str:
-    """
-    Извлекает весь текст из docx-файла.
-
-    Обрабатывает абзацы и ячейки таблиц.
-    Абзацы разделяются переносом строки.
-
-    Args:
-        docx_path: путь к docx-файлу
-
-    Returns:
-        Полный текст документа одной строкой
-    """
-    doc = Document(str(docx_path))
-    texts = []
-
-    for p in doc.paragraphs:
-        if p.text and p.text.strip():
-            texts.append(p.text)
-
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [c.text for c in row.cells if c.text and c.text.strip()]
-            if cells:
-                texts.append(" ".join(cells))
-
-    return "\n".join(texts)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Поиск единиц культурного кода")
+    parser.add_argument(
+        "--lemmatizer",
+        choices=["pymorphy", "natasha", "both"],
+        default="both",
+        help="какой вариант лемматизации использовать (по умолчанию оба со сравнением)",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        help="обработать только учебники, чьё имя содержит подстроку (можно повторять)",
+    )
+    parser.add_argument(
+        "--no-highlight", action="store_true", help="не создавать docx с подсветкой"
+    )
+    parser.add_argument(
+        "--primary",
+        choices=["pymorphy", "natasha"],
+        default=config.PRIMARY_BACKEND,
+        help="бэкенд, по которому собираются основные отчёты",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="не разбирать PDF (по умолчанию считается лист «Только в PDF»)",
+    )
+    parser.add_argument(
+        "--debug-unit", default=None, help="показать варианты и паттерны наименования"
+    )
+    return parser.parse_args(argv)
 
 
-def get_total_words(
-    path: str | Path,
-    tokens: list[dict],
-    fallback_totals: dict[int, int],
-    grade: int,
-) -> int:
-    """
-    Определяет общее количество слов в учебнике.
-
-    Приоритет:
-        1. Число в конце имени файла (Биология_5_35834.docx -> 35834)
-        2. Значение из fallback_totals[grade]
-        3. Подсчёт по токенам (количество токенов с леммой)
-
-    Args:
-        path: путь к файлу
-        tokens: токенизированный текст
-        fallback_totals: словарь {класс: количество слов}
-        grade: номер класса
-
-    Returns:
-        Количество слов (> 0)
-    """
-    import re
-    m = re.search(r'_(\d+)(?:\.\w+)?$', str(path))
-    if m:
-        return int(m.group(1))
-
-    if grade in fallback_totals and fallback_totals[grade]:
-        return fallback_totals[grade]
-
-    # Автоподсчёт по токенам
-    return max(1, sum(1 for t in tokens if t.get('lemma') is not None))
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
-# =============================================================================
-# Основной пайплайн
-# =============================================================================
+def _partial(path: Path) -> Path:
+    """Имя файла для частичного прогона."""
+    return path.with_name(f"{path.stem} (частичный){path.suffix}")
 
-def build_everything(
-    dict_path: str | Path = DICT_PATH,
-    grade_docx: dict = GRADE_DOCX,
-    out_xlsx: str | Path = OUT_XLSX,
-    out_books_dir: str | Path = OUT_BOOKS_DIR,
-    log_dir: str | Path = LOG_DIR,
-    fallback_totals: dict = FALLBACK_TOTALS,
-    grades: tuple = GRADES,
-    norm_per: int = NORM_PER,
-) -> pd.DataFrame:
-    """
-    Полный пайплайн: от словаря терминов до таблицы динамики и учебников.
 
-    Args:
-        dict_path: путь к xlsx со словарём терминов
-        grade_docx: словарь {класс: путь_к_docx}
-        out_xlsx: путь для сохранения итоговой таблицы
-        out_books_dir: директория для аннотированных учебников
-        log_dir: директория для CSV с контекстами
-        fallback_totals: словарь {класс: кол-во слов} для нормировки
-        grades: кортеж обрабатываемых классов
-        norm_per: знаменатель нормировки (стандарт: 1_000_000)
+def debug_unit(name: str, units) -> None:
+    """Печатает варианты поиска и лемма-паттерны для одного наименования."""
+    for backend_name in ("pymorphy", "natasha"):
+        backend = get_backend(backend_name)
+        build_variants(units, backend)
+        matched = [u for u in units if u.name == name]
+        if not matched:
+            lowered = name.lower()
+            matched = [u for u in units if lowered in u.name.lower()]
+        log(f"\n=== {backend_name} ===")
+        for unit in matched:
+            log(f"{unit.name}  [{unit.group_name}]")
+            for variant in unit.variants:
+                log(f"    {variant.kind:12} {variant.surface!r} -> {' '.join(variant.pattern)}")
+        if not matched:
+            log(f"  наименование {name!r} в списке не найдено")
 
-    Returns:
-        DataFrame с итоговой таблицей динамики
-    """
-    # ------------------------------------------------------------------
-    # Инициализация
-    # ------------------------------------------------------------------
-    print("Инициализация препроцессора...")
-    preprocessor = TextPreprocessorWithoutStopwords(
-        stopwords_path=STOPWORDS_PATH,
-        replacements_path=REPLACEMENTS_PATH,
+
+def run_backend(backend_name: str, units, books, is_primary: bool, args):
+    """Прогоняет корпус одним бэкендом, возвращает (результаты, леммы, частоты)."""
+    backend = get_backend(backend_name)
+    log(f"\n=== Лемматизация: {backend_name} ===")
+
+    t0 = time.perf_counter()
+    build_variants(units, backend)
+    index = analyzer.build_pattern_index(units)
+    first_lemmas = analyzer.first_lemma_set(index)
+    variants = sum(len(u.variants) for u in units)
+    log(
+        f"  единиц: {len(units)}, вариантов поиска: {variants}, "
+        f"первых лемм: {len(first_lemmas)}, макс. длина: "
+        f"{analyzer.max_pattern_length(index)} ({time.perf_counter() - t0:.1f} с)"
     )
 
-    # ------------------------------------------------------------------
-    # Загрузка и нормализация словаря терминов
-    # ------------------------------------------------------------------
-    print(f"Читаю словарь терминов: {dict_path}")
-    terms_df = read_dict_terms(dict_path)
+    lemmas: dict[str, str] = {}
+    freq: dict[str, int] = {}
+    results = []
 
-    terms_df["__lemmas"] = None
-    terms_df["__pattern"] = None
+    for book in books:
+        highlight_out = None
+        if is_primary and not args.no_highlight:
+            highlight_out = config.OUT_HIGHLIGHT / book.parent.name / book.name
 
-    patterns_by_len: dict[int, list[str]] = defaultdict(list)
-    pattern_to_terms: dict[str, list[str]] = defaultdict(list)
-    empty_terms = 0
+        result = pipeline.process_book(
+            book, units, index, first_lemmas, backend,
+            highlight_out=highlight_out, lemma_sink=lemmas, form_freq=freq,
+        )
+        results.append(result)
 
-    print("Нормализую термины...")
-    for i, term in terms_df["Термин"].items():
-        lemmas, pattern = normalize_term_to_pattern(term, preprocessor)
-        terms_df.at[i, "__lemmas"] = lemmas
-        terms_df.at[i, "__pattern"] = pattern
-
-        if pattern:
-            patterns_by_len[len(lemmas)].append(pattern)
-            pattern_to_terms[pattern].append(term)
-        else:
-            empty_terms += 1
-
-    if empty_terms:
-        print(
-            f"[Предупреждение] {empty_terms} термин(ов) после нормализации "
-            f"дали пустой паттерн — они будут иметь нулевые частоты."
+        note = ""
+        if result.highlight_stats:
+            hs = result.highlight_stats
+            note = f", подсвечено {hs.spans_applied} в {hs.paragraphs_touched} абз."
+            if hs.spans_skipped_complex_run:
+                note += f" (пропущено {hs.spans_skipped_complex_run} в сложных run)"
+        log(
+            f"  {result.rel_path}: {result.total_hits} вхождений, "
+            f"{result.unique_units} единиц, {result.elapsed:.1f} с{note}"
         )
 
-    # ------------------------------------------------------------------
-    # Определяем паттерны для логирования контекстов
-    # ------------------------------------------------------------------
-    if DEBUG_ALL_TERMS:
-        debug_patterns = {p for pats in patterns_by_len.values() for p in pats}
-    else:
-        debug_patterns = set()
-        for t in DEBUG_TERMS:
-            _, p = normalize_term_to_pattern(t, preprocessor)
-            if p:
-                debug_patterns.add(p)
-
-    # ------------------------------------------------------------------
-    # Подготовка итоговой таблицы
-    # ------------------------------------------------------------------
-    kv_cols = [f"КВ {g} класс" for g in grades]   # количество вхождений
-    nch_cols = [f"НЧ {g} класс" for g in grades]  # нормированная частота
-
-    for col in kv_cols + nch_cols:
-        terms_df[col] = 0.0
-
-    # ------------------------------------------------------------------
-    # Создаём директории
-    # ------------------------------------------------------------------
-    os.makedirs(Path(out_xlsx).parent, exist_ok=True)
-    os.makedirs(out_books_dir, exist_ok=True)
-    if debug_patterns:
-        os.makedirs(log_dir, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # Обработка учебников по классам
-    # ------------------------------------------------------------------
-    for grade in grades:
-        path = grade_docx.get(grade)
-
-        if not path or not Path(path).exists():
-            raise FileNotFoundError(
-                f"Учебник для {grade} класса не найден: {path}\n"
-                f"Проверьте TEXTBOOKS_DIR в config.py или переменную окружения "
-                f"TERM_ANALYZER_TEXTBOOKS."
+    # PDF разбирается до записи книжных отчётов: его вхождения складываются
+    # с основными, поэтому книжные файлы должны их уже содержать.
+    pdf_results = []
+    if is_primary and not args.no_pdf:
+        pairs = pdfsource.pair_pdfs_with_docx(books)
+        if pairs:
+            log(f"  Разбираю PDF ({len(pairs)}) — то, чего нет в .docx…")
+        by_pair = {res.pair_key: res for res in results if res.pair_key}
+        for pdf, docx in pairs:
+            res = pipeline.process_pdf_extra(
+                pdf, docx, units, index, first_lemmas, backend
+            )
+            pdf_results.append(res)
+            merged = ""
+            if config.COUNT_PDF_EXTRA:
+                book_result = by_pair.get(res.pair_key)
+                if book_result is not None:
+                    pipeline.merge_pdf_extra(book_result, res, units)
+                    merged = " — сложено с основными"
+            log(
+                f"    {res.rel_path}: {res.paragraphs} фрагментов вне .docx, "
+                f"{res.total_hits} вхождений, {res.unique_units} единиц, "
+                f"{res.elapsed:.1f} с{merged}"
             )
 
-        print(f"\n[{grade} класс] Обрабатываю: {path}")
+    if is_primary:
+        for book, result in zip(books, results):
+            out = config.OUT_PER_BOOK / book.parent.name / f"{book.stem}_результат.xlsx"
+            report.write_book_report(result, units, out)
 
-        # Извлечение текста и токенизация
-        raw_text = docx_to_text(path)
-        tokens = tokens_with_punct(raw_text, preprocessor)
+    return results, lemmas, freq, pdf_results
 
-        total_words = get_total_words(path, tokens, fallback_totals, grade)
-        print(f"[{grade} класс] Всего слов для нормировки: {total_words:,}")
 
-        # Подсчёт вхождений
-        counts_map, collected = count_patterns_strict(
-            tokens,
-            patterns_by_len,
-            allow_punct_between=ALLOW_PUNCT_BETWEEN,
-            disallow_hyphen_adjacent_for_unigrams=DISALLOW_HYPHEN_ADJACENT_FOR_UNIGRAMS,
-            collect_patterns=debug_patterns,
-            context_window=CONTEXT_WINDOW,
-            max_collect_per_pattern=MAX_CONTEXTS_PER_TERM,
+def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    log("Читаю список единиц культурного кода…")
+    units = load_units()
+    groups = sorted({u.group_sheet for u in units})
+    log(f"  пар «наименование × группа»: {len(units)}, групп: {len(groups)}")
+
+    if args.debug_unit:
+        debug_unit(args.debug_unit, units)
+        return 0
+
+    books = pipeline.find_books(config.CORPUS_ROOT)
+    if args.only:
+        books = [b for b in books if any(part in b.name for part in args.only)]
+    if not books:
+        log("Не найдено ни одного учебника — проверьте --only и config.CORPUS_ROOT")
+        return 1
+    log(f"Учебников к обработке: {len(books)}")
+
+    config.OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Частичный прогон не должен затирать полный сводный отчёт: он собирается
+    # только по обработанным книгам, и подменять им полный нельзя.
+    summary_path = config.OUT_SUMMARY_XLSX
+    compare_path = config.OUT_COMPARE_XLSX
+    if args.only:
+        summary_path = _partial(summary_path)
+        compare_path = _partial(compare_path)
+        log(
+            f"Прогон частичный (--only): сводный отчёт пишется в "
+            f"«{summary_path.name}», полный не трогаю."
         )
 
-        # Логирование контекстов
-        if debug_patterns:
-            write_context_logs(grade, collected, pattern_to_terms, log_dir, path)
+    backends = ["pymorphy", "natasha"] if args.lemmatizer == "both" else [args.lemmatizer]
+    primary = args.primary if args.primary in backends else backends[0]
 
-        # Заполнение таблицы
-        kv_col = f"КВ {grade} класс"
-        nch_col = f"НЧ {grade} класс"
-        denom = max(total_words, 1)
-
-        for i, pattern in terms_df["__pattern"].items():
-            count = counts_map.get(pattern, 0) if pattern else 0
-            terms_df.at[i, kv_col] = int(count)
-            terms_df.at[i, nch_col] = (count / denom) * norm_per
-
-        # Аннотированный учебник
-        base_name = Path(path).stem
-        out_path = Path(out_books_dir) / f"{base_name} — термины.docx"
-        annotate_docx(
-            path,
-            out_path,
-            patterns_by_len,
-            preprocessor,
-            allow_punct_between=ALLOW_PUNCT_BETWEEN,
-            disallow_hyphen_adjacent_for_unigrams=DISALLOW_HYPHEN_ADJACENT_FOR_UNIGRAMS,
+    collected = {}
+    for backend_name in backends:
+        collected[backend_name] = run_backend(
+            backend_name, units, books, backend_name == primary, args
         )
 
-    # ------------------------------------------------------------------
-    # Финализация типов и сохранение Excel
-    # ------------------------------------------------------------------
-    for col in kv_cols:
-        terms_df[col] = pd.to_numeric(terms_df[col], errors='coerce').fillna(0).astype(int)
-    for col in nch_cols:
-        terms_df[col] = pd.to_numeric(terms_df[col], errors='coerce').fillna(0.0)
-
-    order_cols = ["Термин"] + kv_cols + nch_cols
-    result = terms_df[order_cols].copy()
-
-    sheet_name = f"Динамика {min(grades)}-{max(grades)}"
-    with pd.ExcelWriter(str(out_xlsx), engine="openpyxl") as writer:
-        result.to_excel(writer, index=False, sheet_name=sheet_name)
-
-    print(f"\n✓ Таблица динамики:   {out_xlsx}")
-    print(f"✓ Учебники:           {out_books_dir}")
-    if debug_patterns:
-        print(f"✓ Логи контекстов:    {log_dir}")
-
-    return result
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Анализ частотности биологических терминов в учебниках 5–11 классов."
+    primary_results, _, _, pdf_results = collected[primary]
+    log("\nСобираю сводный отчёт…")
+    report.write_summary(
+        primary_results, units, summary_path, pdf_results=pdf_results
     )
-    parser.add_argument(
-        "--debug-term",
-        type=str,
-        default=None,
-        metavar="ТЕРМИН",
-        help=(
-            "Режим отладки: проверить один термин на тестовом тексте. "
-            "Полный пайплайн не запускается. "
-            "Пример: --debug-term \"яйцеклетка\""
-        ),
-    )
-    parser.add_argument(
-        "--debug-text",
-        type=str,
-        default=(
-            "Рис. 4. Спорообразование у растений: женский половой орган "
-            "архегоний с яйцеклеткой, дробление зиготы, молодой спорофит."
-        ),
-        metavar="ТЕКСТ",
-        help="Текст для отладки (используется вместе с --debug-term).",
-    )
-    parser.add_argument(
-        "--config",
-        action="store_true",
-        help="Вывести текущую конфигурацию и завершить работу.",
-    )
-    return parser.parse_args()
+    log(f"  {summary_path}")
 
-
-def main():
-    args = parse_args()
-
-    if args.config:
-        config.print_config_summary()
-        return
-
-    if args.debug_term:
-        # Режим отладки одного термина
-        preprocessor = TextPreprocessorWithoutStopwords(
-            stopwords_path=STOPWORDS_PATH,
-            replacements_path=REPLACEMENTS_PATH,
+    if len(backends) == 2:
+        log("Собираю отчёт сравнения лемматизаторов…")
+        res_a, lem_a, freq_a, _ = collected["pymorphy"]
+        res_b, lem_b, _, _ = collected["natasha"]
+        report.write_comparison(
+            res_a, res_b, units, lem_a, lem_b, freq_a, compare_path
         )
-        debug_term_in_text(
-            term_str=args.debug_term,
-            text=args.debug_text,
-            preprocessor=preprocessor,
-            allow_punct_between=ALLOW_PUNCT_BETWEEN,
-            disallow_hyphen_adjacent_for_unigrams=DISALLOW_HYPHEN_ADJACENT_FOR_UNIGRAMS,
-            window=CONTEXT_WINDOW,
-        )
-        return
+        log(f"  {compare_path}")
 
-    # Проверка конфигурации перед запуском
-    issues = config.validate_config()
-    if issues:
-        print("Обнаружены проблемы с конфигурацией:")
-        for w in issues:
-            print(f"  ⚠  {w}")
-        print(
-            "\nПроверьте пути в config.py или задайте переменные окружения:\n"
-            "  TERM_ANALYZER_DICT       — путь к словарю терминов\n"
-            "  TERM_ANALYZER_TEXTBOOKS  — директория с учебниками\n"
-            "  TERM_ANALYZER_OUTPUT     — директория для результатов\n"
-        )
-        return
-
-    # Полный пайплайн
-    build_everything()
+    total = sum(r.total_hits for r in primary_results)
+    log(f"\nГотово. Всего вхождений ({primary}): {total}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,13 +1,18 @@
-natasha>=1.6.0
-pymorphy2>=0.9.1
-pymorphy2-dicts-ru>=2.4.0
-pymorphy3>=1.2.0
-pymorphy3-dicts-ru>=2.4.0
-dawg-python>=0.7.2
-nltk>=3.8.0
-pandas>=2.0.0
-numpy>=1.24.0
-python-docx>=0.8.11
-openpyxl>=3.1.0
-tqdm>=4.65.0
-setuptools>=65.0.0
+# Python 3.11 (conda env "kk")
+#
+# Вся морфология проекта — pymorphy3. pymorphy2 НЕ используется и НЕ должен
+# быть установлен: natasha тянет его только ради MorphVocab, который здесь
+# не применяется (см. src/natasha_loader.py — там подставляется заглушка).
+
+pymorphy3>=2.0
+razdel>=0.5
+python-docx>=1.1
+openpyxl>=3.1
+pypdf>=4.0
+
+# natasha нужна только как контекстный теггер частей речи (NewsMorphTagger)
+# для второго варианта лемматизации и сравнения с pymorphy3.
+natasha>=1.6
+
+# pkg_resources для внутренних импортов natasha/slovnet
+setuptools<81
