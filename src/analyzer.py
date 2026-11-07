@@ -22,6 +22,8 @@ from src.preprocessing import TextPreprocessor
 
 # Символы дефиса и тире в различных Unicode-представлениях
 HYPHEN_CHARS = {'-', '‑', '–', '—', '−'}
+# Тире: рядом с ним через пробел стоит обычное слово, а не обрывок
+DASH_CHARS = {'–', '—'}
 
 # Регулярное выражение для проверки наличия буквы в токене
 ALPHA_RE = re.compile(r'[A-Za-zА-Яа-яЁё]')
@@ -131,11 +133,23 @@ def build_indexed_words(tokens: list[dict]) -> list[dict]:
             and tokens[i + 1]['text'] in HYPHEN_CHARS
         )
 
+        # Обрывок переноса или составного слова: рядом дефис («полу- чили»,
+        # «водо- и …») или тире без пробела. Тире с пробелами («геномика —
+        # наука…») — знак препинания, слово рядом с ним полноценное.
+        def is_fragment_mark(j: int, glued: bool) -> bool:
+            mark = tokens[j]['text']
+            return mark not in DASH_CHARS or glued
+
+        prev_fragment = prev_is_hyphen and is_fragment_mark(i - 1, tokens[i - 1]['end'] == t['start'])
+        next_fragment = next_is_hyphen and is_fragment_mark(i + 1, tokens[i + 1]['start'] == t['end'])
+
         words.append({
             'lemma': t['lemma'],
             'tok_idx': i,
             'hyph_left': prev_is_hyphen,
             'hyph_right': next_is_hyphen,
+            'frag_left': prev_fragment,
+            'frag_right': next_fragment,
             'inner_hyphen': t['has_inner_hyphen'],
             'start': t['start'],
             'end': t['end'],
