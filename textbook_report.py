@@ -1044,6 +1044,18 @@ def collect(a, pdf: dict, corpus: Corpus, use_cache: bool = True) -> dict:
 
     new_info = {k: info(v) for k, v in new_occ.items()}
     term_info = {k: info(v) for k, v in term_occ.items()}
+    # Для плотности каждый выделенный термин считается один раз: «мембрана»
+    # внутри «клеточной мембраны» — не отдельное вхождение
+    all_spans = sorted({sp for lst in term_occ.values() for sp in lst})
+    density_occ = []
+    for key, lst in term_occ.items():
+        inf = term_info[key]
+        for (s_, e_), i, page in zip(lst, inf["idx"], inf["pages"]):
+            j = bisect_left(all_spans, (s_, e_))
+            nested = any(s2 <= s_ and e_ <= e2 and (s2, e2) != (s_, e_)
+                         for s2, e2 in all_spans[max(0, j - 8):j + 8])
+            if not nested:
+                density_occ.append((key, i, page))
     other_info = {k: info(v) for k, v in other_occ.items()}
 
     print("[Отчёт] определения в учебнике…")
@@ -1083,11 +1095,22 @@ def collect(a, pdf: dict, corpus: Corpus, use_cache: bool = True) -> dict:
     return {
         "pm": pm, "sections": sections, "word_sec": word_sec, "sec_words": sec_words, "page_words": page_words,
         "canon": canon, "groups": groups, "new_occ": new_occ, "new_forms": new_forms, "term_occ": term_occ,
-        "new_info": new_info, "term_info": term_info, "other_info": other_info,
+        "new_info": new_info, "term_info": term_info, "other_info": other_info, "density_occ": density_occ,
         "new_defs": new_defs, "term_defs": term_defs, "other_defs": other_defs,
         "subj": subj, "prior": prior, "new_prior": new_prior, "term_prior": term_prior,
         "corpus": corpus,
     }
+
+
+DENSITY_FORMULA = "Плотность = Т / С × 100"
+DENSITY_FORMULA_TEXT = (
+    "Плотность = Т / С × 100, где Т — число выделенных в тексте терминов (из всех словарей: ФРП, указатель "
+    "учебника, словарь терминов; каждое вхождение считается, составной термин — одно вхождение, слово внутри "
+    "более длинного термина отдельно не считается), С — число слов. Считается только основной текст "
+    "параграфа: от начала параграфа до рубрики «Тренируемся»; вопросы, «Это интересно», «Шаги к успеху», "
+    "введение, главы и приложения не входят. Страница берётся по PDF издательства. Пример (10 класс, с. 78): "
+    "81 термин на 234 словах — 81 / 234 × 100 = 34,6 термина на 100 слов."
+)
 
 
 def section_rows(a, R: dict) -> list[list]:
@@ -1095,10 +1118,9 @@ def section_rows(a, R: dict) -> list[list]:
     word_sec = R["word_sec"]
     terms_by_sec, new_by_sec = defaultdict(Counter), defaultdict(Counter)
     new_idx_by_sec = defaultdict(list)
-    for key, inf in R["term_info"].items():
-        for i in inf["idx"]:
-            if i < len(word_sec) and word_sec[i]:
-                terms_by_sec[word_sec[i]][key] += 1
+    for key, i, _ in R["density_occ"]:
+        if i < len(word_sec) and word_sec[i]:
+            terms_by_sec[word_sec[i]][key] += 1
     for key, inf in R["new_info"].items():
         for i in inf["idx"]:
             if i < len(word_sec) and word_sec[i]:
@@ -1136,8 +1158,9 @@ def section_rows(a, R: dict) -> list[list]:
 
 SECTION_COLUMNS = [
     "Параграф", "Название", "Страницы параграфа", "Страницы основного текста (до «Тренируемся»)",
-    "Слов в основном тексте", "Вхождений терминов", "Разных терминов", "Терминов на 100 слов",
-    "Плотность терминов", "Вхождений новых слов", "Разных новых слов", "Новых слов на 1000 слов",
+    "Слов в основном тексте (С)", "Вхождений терминов (Т)", "Разных терминов",
+    "Терминологическая плотность = Т / С × 100 (терминов на 100 слов)",
+    "Зона плотности", "Вхождений новых слов", "Разных новых слов", "Новых слов на 1000 слов",
     "Среднее расстояние между новыми словами, слов", "Самые частые термины", "Новые слова параграфа",
 ]
 
@@ -1248,6 +1271,10 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
         ["Терминов в словарях (после приведения к начальной форме)", a.patterns_total],
         *dictionary_summary(a),
         ["Параграфов", len(R["sections"])],
+        ["Как считается терминологическая плотность", DENSITY_FORMULA_TEXT],
+        ["Терминологическая плотность учебника (весь основной текст параграфов)",
+         round(sum(1 for _, i, _ in R["density_occ"] if i < len(R["word_sec"]) and R["word_sec"][i])
+               / max(1, sum(R["sec_words"].values())) * 100, 1)],
         ["Параграфы с высокой плотностью терминов", ", ".join(high)],
         ["Не выделено: мусор распознавания (лемм)", sum(1 for w in a.stats_skipped if w in a.junk)],
         ["Не выделено: редкие, но знакомые слова (лемм)", sum(1 for w in a.stats_skipped if w not in a.junk)],
@@ -1394,8 +1421,10 @@ def guide_rows(a, bio_span: str, all_span: str, morph) -> list[list[str]]:
                               "параграфа до рубрики «Тренируемся». Сама рубрика и всё, что после неё "
                               "(вопросы, «Совершенствуемся», «Обсуждаем», «Это интересно», «Шаги к "
                               "успеху»), не считаются. Страницы глав, введения и приложений не входят."],
-        ["Плотность терминов", "Вхождений терминов на 100 слов основного текста. «высокая» — четверть "
-                               "параграфов с самой большой плотностью, «низкая» — с самой маленькой."],
+        ["Терминологическая плотность", DENSITY_FORMULA_TEXT + " Для параграфа Т и С считаются по всему "
+                                        "основному тексту параграфа. Зона: «высокая» — четверть параграфов "
+                                        "с самой большой плотностью, «низкая» — четверть с самой маленькой, "
+                                        "остальные — «средняя»."],
         [h.DICT_COLUMN, h.dictionary_note(morph)],
     ]
 
@@ -1421,7 +1450,7 @@ def format_workbook(path: Path, check_rows: list | None = None) -> None:
         "Сводка": [60, 70],
         "Новые слова": [24, 34, 11, 22, 14, 22, 20, 70, 70, 20, 14, 34, 13, 13, 30, 14],
         "Термины": [32, 11, 30, 14, 22, 13, 26, 12, 34, 20, 70, 60, 20, 13, 13, 30, 13, 22],
-        "Параграфы": [9, 40, 12, 18, 11, 11, 10, 10, 11, 11, 10, 11, 14, 50, 50],
+        "Параграфы": [9, 40, 12, 18, 12, 12, 10, 22, 11, 11, 10, 11, 14, 50, 50],
         "Не выделено": [26, 12, 22, 40],
         "Проверка определений": [26, 18, 24, 18, 9, 130],
         "Словари": [20, 42, 12, 30, 28, 34],
