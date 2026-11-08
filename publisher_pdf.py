@@ -169,7 +169,7 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
         if not verdict.startswith(("не встречалось", "редко", "давно", "в биологии давно")):
             continue
         bio, allc = int(sum(m["bio"].values())), int(sum(m["all"].values()))
-        last = f", последний раз в {m['last']} кл." if m["last"] else ""
+        last = f", последний раз в {m['last']} классе" if m["last"] else ""
         add(R["term_defs"][k]["first_page"], "old", k,
             f"Термин «{k}»: определения в учебнике нет, а ученик может его не помнить — в прошлых "
             f"классах встречался в учебниках биологии {bio} раз, во всех учебниках {allc} раз{last}. "

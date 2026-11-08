@@ -375,7 +375,10 @@ def display_lemma(lemma: str, morph) -> str:
 # =============================================================================
 
 QUOTE = r"[»\"”]?"
-LEAD = rf"^\s*{QUOTE}\s*(?:\([^)]{{0,160}}\)\s*)?(?:,\s*или\s+[^,—–]{{1,60}},\s*)?"
+# Между словом и тире может стоять: скобка («(от греч. …)»), синоним через «или»
+# («, или белки-наставники,»), синоним со скобкой («, или эмергентность (от англ. …)»)
+LEAD = (rf"^\s*{QUOTE}\s*(?:\([^)]{{0,160}}\)\s*)?"
+        rf"(?:,\s*или\s+(?:[^,—–()]{{1,60}}?\s*\([^)]{{0,160}}\)\s*,?\s*|[^,—–]{{1,60}},\s*))?")
 NAMING_BEFORE = re.compile(
     r"(называ\w*|назва\w*|счита\w*|получил\w*\s+(?:\w+\s+)?назван\w*|носит\w*\s+назван\w*|именуют\w*|"
     r"обознача\w*\s+(?:\w+\s+)?(?:термином|понятием)|термином|понятием)[\s:]+(?:[\w-]+[\s:,]+){0,3}[«\"“]?\s*$"
@@ -475,6 +478,14 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
     dm = DEF_AFTER.match(after)
     if dm and not (dm.group(1).startswith("называ") and INSTRUMENTAL.search(word)):
         return "def"
+    # «основным направлением нейробионики является изучение физиологии нервной системы»,
+    # «предметом генетики являются…» — что изучает наука или направление
+    if re.search(r"(?:направлени|предмет|задач|цель|объект)\w*\s+(?:[\w-]+\s+)?$", before) and \
+            re.match(r"^\s*(?:[а-яё-]+\s+)?явля\w+\s", after):
+        return "def"
+    # «Цитология изучает строение клетки», «экология исследует…»
+    if words_before <= 3 and re.match(r"^\s*(?:изуча\w+|исследу\w+|занима\w+\s+(?:изучением|исследованием))\s", after):
+        return "def"
     # «Белки-ферменты являются катализаторами…» — подлежащее в начале предложения
     if words_before <= 2 and re.match(r"^\s*(?:[а-яё-]+\s+)?явля\w+\s", after):
         return "def"
@@ -514,6 +525,13 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
         return "explain"
     # Придаточное сразу после слова: «эндосимбиоза, при котором бактерии поселились…»
     if RELATIVE_AFTER.match(after):
+        return "explain"
+    # Причастный оборот сразу после слова: «полипептиды, содержащие сотни аминокислотных
+    # остатков», «микориза, образуемая мицелием грибов и корнями…»
+    if PARTICIPLE_AFTER.match(after):
+        return "explain"
+    # Пояснение через двоеточие: «происходит их олигомеризация: они приобретают…»
+    if re.match(r"^\s*:\s*[а-яё]", after):
         return "explain"
     if re.match(r"^\s*(?:[а-яё-]+\s+)?[а-яё-]+\s*(?:,\s*|\(\s*)(?:т\.\s*е\.|то\s+есть|или\s)", after):
         return "explain"
@@ -609,6 +627,10 @@ def figure_of(text: str, ss: int, se: int, s: int) -> str | None:
 
 
 ETYMON_STATUS = "слово-источник: перевод дан рядом"
+
+
+DERIV_SUFFIXES = ("альность", "ность", "ость", "ический", "ческий", "ичный", "альный", "ский", "ской",
+                  "изм", "ист", "ный", "ной", "ний", "ый", "ий", "ой", "ия", "ие", "а", "я", "ь")
 
 
 def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap,
@@ -1129,7 +1151,29 @@ def collect(a, pdf: dict, corpus: Corpus, use_cache: bool = True) -> dict:
         for w in build_indexed_words(tokens):
             lemma_pos[w["lemma"]].append((b_start + w["start"], b_start + w["end"]))
     new_all = {c: sorted({x for m in ms for x in lemma_pos.get(m, [])} | set(new_occ[c])) for c, ms in groups.items()}
-    new_defs = find_definitions(a, new_all, pm)
+    # Определение однокоренного слова тоже засчитывается: «эмерджентных свойств»
+    # и рядом «Эмерджентность, или эмергентность (от англ. …) — наличие…»
+    # Однокоренные — только те, что отличаются суффиксом или окончанием
+    # («эмерджент-ный / эмерджент-ность», «мутуал-ист / мутуал-изм»), а не просто
+    # длинным общим началом («люцифераза» и «люциферин» — разные вещества)
+    def stems(w: str) -> set[str]:
+        out = {w}
+        for suf in DERIV_SUFFIXES:
+            if w.endswith(suf) and len(w) - len(suf) >= 5:
+                out.add(w[: len(w) - len(suf)])
+        return out
+
+    new_extra = {}
+    stem_index = defaultdict(set)
+    for l in lemma_pos:
+        for st in stems(l):
+            stem_index[st].add(l)
+    for c, ms in groups.items():
+        if len(c) < 7:
+            continue
+        related = {l for st in stems(c) for l in stem_index[st]} - set(ms) - {c}
+        new_extra[c] = sorted(x for l in related for x in lemma_pos[l])
+    new_defs = find_definitions(a, new_all, pm, new_extra)
     term_extra = {}
     for key in term_occ:
         words = key.split()
