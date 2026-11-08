@@ -51,6 +51,17 @@ MIN_SUBJECT_WORDS = 100_000
 BIO_SHARE = 0.25
 # Сколько лет без упоминаний — «давно не встречалось»
 LONG_GAP_YEARS = 4
+# Общеупотребительный термин («человек», «жизнь», «наблюдение»): во всех
+# учебниках прошлых классов встречался не меньше EVERYDAY_TOTAL раз, из них
+# не меньше EVERYDAY_PRIMARY раз ещё в начальной школе (2–4 классы).
+# Такие термины знакомы почти всем, замечаний издателю по ним нет.
+EVERYDAY_TOTAL = 300
+EVERYDAY_PRIMARY = 20
+
+
+def is_everyday(m: dict) -> bool:
+    allg = m["all"]
+    return sum(allg.values()) >= EVERYDAY_TOTAL and sum(allg.get(g, 0) for g in (2, 3, 4)) >= EVERYDAY_PRIMARY
 # Вхождения одного слова дальше этого числа страниц — «далеко друг от друга»
 FAR_PAGES = 20
 
@@ -367,7 +378,7 @@ QUOTE = r"[»\"”]?"
 LEAD = rf"^\s*{QUOTE}\s*(?:\([^)]{{0,160}}\)\s*)?(?:,\s*или\s+[^,—–]{{1,60}},\s*)?"
 NAMING_BEFORE = re.compile(
     r"(называ\w*|назва\w*|счита\w*|получил\w*\s+(?:\w+\s+)?назван\w*|носит\w*\s+назван\w*|именуют\w*|"
-    r"обознача\w*\s+(?:\w+\s+)?(?:термином|понятием)|термином|понятием)\s+(?:[\w-]+\s+){0,2}[«\"“]?\s*$"
+    r"обознача\w*\s+(?:\w+\s+)?(?:термином|понятием)|термином|понятием)[\s:]+(?:[\w-]+[\s:,]+){0,3}[«\"“]?\s*$"
 )
 # После тире — родовое понятие определения, перед ним может быть до двух
 # прилагательных: «геномика — наука, изучающая…», «ретротранспозоны —
@@ -377,7 +388,7 @@ GENUS_AFTER_DASH = re.compile(
     r"(?:это\b|наук|процесс|способн|совокупн|веществ|соединени|фермент|бел[оо]?к|органоид|структур|"
     r"явлени|метод|част[ьи]|групп|форм[аы]|особ[аоыи]|специальн|тип\b|вид\b|комплекс|молекул|клет[ко]|"
     r"участ|раздел|отрасл|направлени|свойств|состояни|образовани|пузыр|углевод|липид|кислот|орган\b|ткан|"
-    r"бактери|\w*полимер|прибор|предк|предок|потомк|родственник|рецептор|учени|животн|растени|организм|"
+    r"бактери|\w*полимер|синтез|прибор|предк|предок|потомк|родственник|рецептор|учени|животн|растени|организм|"
     r"гриб|черв|рыб|рептили|ящер|динозавр|гормон|пигмент|порок|заболевани|болезн|ген\b|гены|слой|оболочк|"
     r"мембран|нит[ьи]|сахар|спирт|элемент|частиц|фаз|период|стади|этап|реакци|механизм|систем|отдел|"
     r"класс|отряд|семейств|род\b|царств|сообществ|популяци|признак|продукт|препарат|фактор|вирус|"
@@ -440,7 +451,12 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
     before, after = sentence[:ws].lower(), sentence[we:].lower()
     word = sentence[ws:we].lower()
     if ETYMON_BEFORE.search(before):
-        return None
+        # «Атом (от греч. атомос — неделимый)»: само слово — греческое слово-источник,
+        # его перевод дан тут же
+        return "etymon"
+    # «АДФ (аденозиндифосфорной кислоты)»: слово — расшифровка сокращения
+    if re.search(r"[А-ЯЁ]{2,}\+?\s*\(\s*$", sentence[:ws]):
+        return "explain"
     words_before = len(re.findall(r"\w+", before))
     clause_start = words_before <= 6 or bool(CLAUSE_START.search(before))
     if DASH_THIS.match(after):
@@ -458,6 +474,12 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
         return "def"
     dm = DEF_AFTER.match(after)
     if dm and not (dm.group(1).startswith("называ") and INSTRUMENTAL.search(word)):
+        return "def"
+    # «Белки-ферменты являются катализаторами…» — подлежащее в начале предложения
+    if words_before <= 2 and re.match(r"^\s*(?:[а-яё-]+\s+)?явля\w+\s", after):
+        return "def"
+    # «Они являются стоп-кодонами, которые сигнализируют…»
+    if re.search(r"\bявля\w+\s+$", before) and RELATIVE_AFTER.match(after):
         return "def"
     if re.search(r"\bпод\s+[«\"“]?$", before) and re.match(rf"^\s*{QUOTE}[^.]{{0,60}}?понима", after):
         return "def"
@@ -495,6 +517,12 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
         return "explain"
     if re.match(r"^\s*(?:[а-яё-]+\s+)?[а-яё-]+\s*(?:,\s*|\(\s*)(?:т\.\s*е\.|то\s+есть|или\s)", after):
         return "explain"
+    # «Закон единообразия … (первый закон Менделя) — при скрещивании…»: после скобки — определение
+    if re.search(r"\(\s*(?:[а-яё]+\s+)?$", before) and re.match(r"^\s*\)\s*[—–]\s*\S", after):
+        return "def"
+    # «длительные промежутки времени — эоны»: описание перед тире называет слово
+    if re.search(r"\w[»\"”]?\s*[—–]\s*$", before) and re.match(r"^\s*(?:[.;)]|$)", after):
+        return "def"
     if GLOSS_AFTER.match(after) or (re.search(r"\(\s*(?:или\s+)?$", before) and re.match(r"^\s*\)", after)):
         return "explain"
     if re.search(r"[—–]\s*$", before) and re.match(r"^\s*(?:[.;,)—–]|$)", after):
@@ -505,10 +533,14 @@ def classify_definition(sentence: str, ws: int, we: int) -> str | None:
 def sentence_bounds(text: str, s: int, e: int, para_breaks: bool) -> tuple[int, int]:
     """Границы предложения вокруг [s, e)."""
     lo, hi = max(0, s - 600), min(len(text), e + 600)
-    stop = r"[.!?…]\s+(?=[А-ЯЁA-Z«(—–\d])"
+    # Граница: конец предложения перед заглавной буквой, пустая строка или строка
+    # с номером страницы («…организме\n76\n\nБелки-ферменты…»)
+    stop = r"[.!?…]\s+(?=[А-ЯЁA-Z«(—–\d])|\n\s*\n|(?<=\d)[ \t]*\n"
     if para_breaks:
         stop += r"|\n"
-    left = list(re.finditer(stop, text[lo:s]))
+    # Срез захватывает и первую букву слова: иначе проверка «дальше заглавная»
+    # не видит её, и предложение, начинающееся с термина, слипается с предыдущим
+    left = [m for m in re.finditer(stop, text[lo:s + 1]) if m.end() <= s - lo]
     start = lo + left[-1].end() if left else lo
     right = re.search(r"[.!?…](?=\s+[А-ЯЁA-Z«(—–\d]|\s*$)" + (r"|\n" if para_breaks else ""), text[e:hi])
     end = e + right.end() if right else hi
@@ -576,7 +608,11 @@ def figure_of(text: str, ss: int, se: int, s: int) -> str | None:
     return None
 
 
-def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap) -> dict[str, dict]:
+ETYMON_STATUS = "слово-источник: перевод дан рядом"
+
+
+def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap,
+                     extra_occ: dict[str, list] | None = None) -> dict[str, dict]:
     """
     Для каждого слова/термина: есть ли в учебнике определение, где и какое.
 
@@ -590,12 +626,20 @@ def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap) -> dict[str, d
     keys = emphasis_keys(a.paragraphs)
     result = {}
     for key, occs in occ_by_key.items():
-        best = {"def": None, "explain": None}
+        best = {"def": None, "explain": None, "etymon": None}
         bold = None
         figures = []
         contexts, seen = [], set()
-        # Обрывки в 1–3 буквы («оту» из «раб оту») — мусор, определение не ищется
-        short_junk = len(re.sub(r"[^а-яёa-z]", "", key)) < 4
+        # Обрывки в 1–3 буквы («оту» из «раб оту») — мусор, определение не ищется;
+        # сокращения заглавными («ВИЧ», «ГТФ») — не мусор
+        first_surface = text[occs[0][0]:occs[0][1]] if occs else ""
+        short_junk = len(re.sub(r"[^А-Яа-яЁёA-Za-z]", "", first_surface)) < 4 and not first_surface.isupper()
+        # Определение составного термина через прилагательное: «вещества…
+        # называют гидрофильными» — только для поиска определения
+        for s, e in (extra_occ or {}).get(key, []):
+            ss, se = sentence_bounds(text, s, e, para_breaks)
+            if best["def"] is None and classify_definition(text[ss:se], s - ss, e - ss) == "def":
+                best["def"] = (clean_sentence(with_context(text, ss, se, para_breaks), 500), pm.page_of(s))
         for s, e in occs:
             ss, se = sentence_bounds(text, s, e, para_breaks)
             fig = figure_of(text, ss, se, s)
@@ -606,8 +650,23 @@ def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap) -> dict[str, d
             kind = None if short_junk else classify_definition(text[ss:se], s - ss, e - ss)
             if kind and best[kind] is None:
                 best[kind] = (clean_sentence(with_context(text, ss, se, para_breaks), 500), pm.page_of(s))
-            if bold is None and is_emphasized(a, s, e, keys):
+            emph = is_emphasized(a, s, e, keys)
+            if bold is None and emph:
                 bold = pm.page_of(s)
+            # Жирный заголовок-врезка «Транспортные белки.» — термин описан в абзаце под ним
+            # Жирный термин открывает описательное предложение: «Транспортные белки
+            # участвуют в переносе…» — так учебник вводит термин
+            if not kind and best["def"] is None and emph and not text[ss:s].strip() and \
+                    len(re.findall(r"\w+", text[e:se])) >= 4 and not text[ss:se].rstrip().endswith("?"):
+                best["def"] = (clean_sentence(text[ss:se], 500), pm.page_of(s))
+            # (не жирный заголовок из одного термина — «Систематика.» — тоже)
+            head = text[ss:se].strip()
+            n_head = len(re.findall(r"\w+", head))
+            if not kind and best["def"] is None and head.endswith(".") and (
+                    (emph and n_head <= len(key.split()) + 3) or n_head <= len(key.split()) + 1):
+                if True:
+                    nss, nse = sentence_bounds(text, min(len(text) - 1, se + 1), min(len(text), se + 2), para_breaks)
+                    best["def"] = (clean_sentence(head + " " + text[nss:nse], 500), pm.page_of(s))
             # Все предложения со словом — чтобы проверить «нет определения» глазами;
             # повторы (подпись к рисунку дублируется при конвертации) убираются
             sent = re.sub(r"\s+", " ", text[ss:se]).strip()
@@ -620,6 +679,9 @@ def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap) -> dict[str, d
         first_page = pm.page_of(occs[0][0]) if occs else None
         if best["def"]:
             status, (sent, page) = "есть", best["def"]
+        elif best["etymon"]:
+            status, (sent, _) = ETYMON_STATUS, best["etymon"]
+            page = None
         elif best["explain"]:
             status, (sent, page) = "только пояснение", best["explain"]
         elif figures:
@@ -630,6 +692,7 @@ def find_definitions(a, occ_by_key: dict[str, list], pm: PageMap) -> dict[str, d
         else:
             status, sent, page = "нет", "", None
         result[key] = {"status": status, "text": sent, "page": page, "first_page": first_page,
+                       "explain_page": best["explain"][1] if best["explain"] else None,
                        "contexts": contexts, "figures": figures}
     return result
 
@@ -1067,13 +1130,19 @@ def collect(a, pdf: dict, corpus: Corpus, use_cache: bool = True) -> dict:
             lemma_pos[w["lemma"]].append((b_start + w["start"], b_start + w["end"]))
     new_all = {c: sorted({x for m in ms for x in lemma_pos.get(m, [])} | set(new_occ[c])) for c, ms in groups.items()}
     new_defs = find_definitions(a, new_all, pm)
-    term_defs = find_definitions(a, term_occ, pm)
+    term_extra = {}
+    for key in term_occ:
+        words = key.split()
+        if len(words) > 1 and len(words[0]) >= 6 and a.preprocessor.morph.parse(words[0])[0].tag.POS == "ADJF":
+            term_extra[key] = lemma_pos.get(words[0], [])
+    term_defs = find_definitions(a, term_occ, pm, term_extra)
 
     print("[Отчёт] предметы и упоминания в прошлых классах…")
     subj = corpus.counts(list(new_occ) + list(term_occ))
     prior = PriorMentions(a.grade, pre, a.patterns_by_len, a.verb_shadowed, use_cache)
     new_prior = {k: prior.of(k, False, groups[k]) for k in new_occ}
     term_prior = {k: prior.of(k, True, corpus_grades=subj[k]["grade"]) for k in term_occ}
+    everyday = {k for k, m in term_prior.items() if is_everyday(m)}
 
     print("[Отчёт] определения в других учебниках…")
     other_defs = {}
@@ -1097,7 +1166,7 @@ def collect(a, pdf: dict, corpus: Corpus, use_cache: bool = True) -> dict:
         "canon": canon, "groups": groups, "new_occ": new_occ, "new_forms": new_forms, "term_occ": term_occ,
         "new_info": new_info, "term_info": term_info, "other_info": other_info, "density_occ": density_occ,
         "new_defs": new_defs, "term_defs": term_defs, "other_defs": other_defs,
-        "subj": subj, "prior": prior, "new_prior": new_prior, "term_prior": term_prior,
+        "subj": subj, "prior": prior, "new_prior": new_prior, "term_prior": term_prior, "everyday": everyday,
         "corpus": corpus,
     }
 
@@ -1216,7 +1285,7 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
             "да" if k in a.new_terms else "", dict_names(a, k), bio, where,
             d["status"], (f"с. {d['page']}: {d['text']}" if d["text"] else ""),
             R["other_defs"].get(k, "") if k in a.new_terms else "", "; ".join(d["figures"]),
-            *prior_cells(m), m["last"] or "", prior.verdict(m),
+            *prior_cells(m), m["last"] or "", prior.verdict(m), "да" if k in R["everyday"] else "",
         ])
     terms_df = pd.DataFrame(term_rows, columns=[
         "Термин (слова в начальной форме)", "Вхождений в учебнике", "Страницы",
@@ -1225,6 +1294,7 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
         "Определение в учебнике", "Текст определения (страница)", "Определение в других учебниках",
         "Рисунок (где слово показано или упомянуто рядом)",
         BIO_COL, ALL_COL, BY_COL, "Последний раз встречался, класс", "Помнит ли ученик",
+        "Общеупотребительный (без замечаний издателю)",
     ])
 
     # --- Параграфы -------------------------------------------------------------
@@ -1421,6 +1491,11 @@ def guide_rows(a, bio_span: str, all_span: str, morph) -> list[list[str]]:
                               "параграфа до рубрики «Тренируемся». Сама рубрика и всё, что после неё "
                               "(вопросы, «Совершенствуемся», «Обсуждаем», «Это интересно», «Шаги к "
                               "успеху»), не считаются. Страницы глав, введения и приложений не входят."],
+        ["Общеупотребительный", f"Термин, знакомый почти всем ученикам: во всех школьных учебниках прошлых "
+                                f"классов встречался не меньше {EVERYDAY_TOTAL} раз, из них не меньше "
+                                f"{EVERYDAY_PRIMARY} раз ещё в начальной школе (2–4 классы). Например, «человек», "
+                                f"«жизнь», «наблюдение». В рекомендациях издателю по таким терминам замечаний нет; "
+                                f"в подсветке и плотности они учитываются."],
         ["Терминологическая плотность", DENSITY_FORMULA_TEXT + " Для параграфа Т и С считаются по всему "
                                         "основному тексту параграфа. Зона: «высокая» — четверть параграфов "
                                         "с самой большой плотностью, «низкая» — четверть с самой маленькой, "
@@ -1449,7 +1524,7 @@ def format_workbook(path: Path, check_rows: list | None = None) -> None:
     widths = {
         "Сводка": [60, 70],
         "Новые слова": [24, 34, 11, 22, 14, 22, 20, 70, 70, 20, 14, 34, 13, 13, 30, 14],
-        "Термины": [32, 11, 30, 14, 22, 13, 26, 12, 34, 20, 70, 60, 20, 13, 13, 30, 13, 22],
+        "Термины": [32, 11, 30, 14, 22, 13, 26, 12, 34, 20, 70, 60, 20, 13, 13, 30, 13, 22, 16],
         "Параграфы": [9, 40, 12, 18, 12, 12, 10, 22, 11, 11, 10, 11, 14, 50, 50],
         "Не выделено": [26, 12, 22, 40],
         "Проверка определений": [26, 18, 24, 18, 9, 130],

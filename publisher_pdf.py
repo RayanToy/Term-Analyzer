@@ -24,7 +24,7 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont
 
 import config
-from textbook_report import FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc, term_annotations
+from textbook_report import EVERYDAY_PRIMARY, EVERYDAY_TOTAL, FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc, term_annotations
 
 DPI = 150
 CANVAS = (int(11.69 * DPI), int(8.27 * DPI))      # A4 альбомная
@@ -49,6 +49,8 @@ PANEL_BG = (247, 247, 244)
 DENSE_PAGE_QUANTILE = 0.9
 MIN_PAGE_WORDS = 120
 MANY_NEW_ON_PAGE = 4
+# «Определение дано позже первого упоминания» — если между ними не меньше стольких страниц
+LATE_MIN_PAGES = 3
 
 
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -86,7 +88,12 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
         for p in range(s["start"], s["end"] + 1):
             sec_of_page[p] = s
 
+    everyday = R.get("everyday", set())
+
     def add(page, kind, key, text, frame=False):
+        # Общеупотребительные термины («человек», «жизнь») знакомы всем — без замечаний
+        if key and key in everyday:
+            return
         if page:
             recs[page].append({"kind": kind, "key": key, "text": text, "frame": frame})
 
@@ -96,13 +103,31 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
     is_frp = lambda k: "frp" in sources.get(k, ())
     items += [("term", k, R["term_defs"][k], R["term_info"][k]) for k in R["term_occ"]
               if k in a.new_terms or is_frp(k)]
+    word_sec = R["word_sec"]
+
+    def main_first(kind, k):
+        """Первое упоминание в основном тексте параграфа (не в «Вы узнаете», вопросах, ключевых словах)."""
+        inf = R["new_info" if kind == "new" else "term_info"].get(k)
+        if not inf:
+            return None
+        for i, p in zip(inf["idx"], inf["pages"]):
+            if p and i < len(word_sec) and word_sec[i]:
+                return p
+        return None
+
+    def may_forget(k):
+        m = R["term_prior"].get(k)
+        return bool(m) and not R["prior"].verdict(m).startswith("встречалось недавно")
+
     for kind, k, d, inf in items:
+        # Новое слово, которое в другой форме выделено как термин с определением, — без замечания
+        if kind == "new" and R["term_defs"].get(k, {}).get("status") == "есть":
+            continue
         first = d["first_page"]
         if kind == "new":
             what = f"новое слово «{k}»"
         elif is_frp(k):
-            what = f"термин ФРП «{k}» (требуется рабочей программой" + (
-                ", в нём незнакомое ученику слово)" if k in a.new_terms else ")")
+            what = f"термин ФРП «{k}»" + (" (в нём незнакомое ученику слово)" if k in a.new_terms else "")
         else:
             what = f"термин «{k}» (в нём незнакомое ученику слово)"
         sample = R["other_defs"].get(k, "")
@@ -121,7 +146,9 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
         elif d["status"] == "только пояснение":
             add(first, "explain", k, f"{(what[:1].upper() + what[1:])}: есть только пояснение "
                                      f"(с. {d['page']}). При необходимости дать полное определение.", False)
-        elif d["page"] and first and d["page"] > first:
+        elif d["page"] and main_first(kind, k) and d["page"] - main_first(kind, k) >= LATE_MIN_PAGES                 and (kind == "new" or k in a.new_terms or may_forget(k))                 and not (d.get("explain_page") and d["explain_page"] <= main_first(kind, k)):
+            # (если при первом упоминании уже есть пояснение — «белковой оболочки (капсида)» — не требуем переноса)
+            first = main_first(kind, k)
             add(first, "late", k, f"{(what[:1].upper() + what[1:])} впервые встречается здесь, а определение дано "
                                   f"только на с. {d['page']}. Перенести определение к первому упоминанию "
                                   f"или дать ссылку на с. {d['page']}.", True)
@@ -453,7 +480,8 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         "Виды замечаний:",
         f"  • нет определения при первом упоминании нового слова или термина — {kinds['nodef']}",
         f"  • определения нет, но слово показано на рисунке (отдельный случай) — {kinds['fig']}",
-        f"  • определение дано позже первого упоминания — {kinds['late']}",
+        f"  • определение дано на {LATE_MIN_PAGES}+ страниц позже первого упоминания в основном тексте (для новых "
+        f"слов и терминов, которые ученик может не знать) — {kinds['late']}",
         f"  • есть только пояснение (синоним, «т. е.», происхождение слова) — {kinds['explain']}",
         f"  • термин без определения, который ученик может не помнить (не встречался, встречался редко "
         f"или {LONG_GAP_YEARS}+ лет назад) — {kinds['old']}",
@@ -473,6 +501,9 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         "Цвет — зона по распределению страниц: синяя — низкая (четверть самых разреженных страниц), "
         "зелёная — средняя, оранжевая — повышенная (от 75 до 90 %), красная — высокая (10 % самых плотных).",
         "",
+        f"Общеупотребительные термины (во всех учебниках прошлых классов встречались {EVERYDAY_TOTAL}+ раз, из "
+        f"них {EVERYDAY_PRIMARY}+ раз ещё в начальной школе: «человек», «жизнь», «наблюдение» и т. п.) знакомы "
+        f"почти всем, поэтому замечаний по ним нет; в плотности терминов они учитываются. "
         "Определения и пояснения найдены автоматически по шаблонам («X — это…», «…называют X» и т. п.), "
         "поэтому каждое замечание стоит проверить. Это черновик для обсуждения вида отчёта.",
     ]
