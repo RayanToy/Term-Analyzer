@@ -108,21 +108,21 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
         sample = R["other_defs"].get(k, "")
         sample_txt = f"\nОбразец из другого учебника — {sample}" if sample else ""
         if d["status"] == "нет":
-            add(first, "nodef", k, f"{what.capitalize()}: определения в учебнике нет. "
+            add(first, "nodef", k, f"{(what[:1].upper() + what[1:])}: определения в учебнике нет. "
                                    f"Дать определение при первом упоминании.{sample_txt}", True)
         elif d["status"] == FIG_STATUS:
             figs = ", ".join(d["figures"][:3])
-            add(first, "fig", k, f"{what.capitalize()}: определения в тексте нет, но слово показано на рисунке "
+            add(first, "fig", k, f"{(what[:1].upper() + what[1:])}: определения в тексте нет, но слово показано на рисунке "
                                  f"({figs}). Проверить, понятно ли значение из рисунка; при необходимости "
                                  f"дать определение в тексте или в подписи.{sample_txt}", True)
         elif d["status"] == "выделено жирным, определения нет":
-            add(first, "nodef", k, f"{what.capitalize()} выделено жирным, но не определено. "
+            add(first, "nodef", k, f"{(what[:1].upper() + what[1:])} выделено жирным, но не определено. "
                                    f"Добавить определение.{sample_txt}", True)
         elif d["status"] == "только пояснение":
-            add(first, "explain", k, f"{what.capitalize()}: есть только пояснение "
+            add(first, "explain", k, f"{(what[:1].upper() + what[1:])}: есть только пояснение "
                                      f"(с. {d['page']}). При необходимости дать полное определение.", False)
         elif d["page"] and first and d["page"] > first:
-            add(first, "late", k, f"{what.capitalize()} впервые встречается здесь, а определение дано "
+            add(first, "late", k, f"{(what[:1].upper() + what[1:])} впервые встречается здесь, а определение дано "
                                   f"только на с. {d['page']}. Перенести определение к первому упоминанию "
                                   f"или дать ссылку на с. {d['page']}.", True)
 
@@ -166,6 +166,9 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
     cut = vals[int(len(vals) * DENSE_PAGE_QUANTILE)] if vals else 0
     mean = statistics.mean(vals) if vals else 0
     R["page_density"], R["page_density_cut"], R["page_density_mean"] = dens, cut, mean
+    R["page_terms"] = page_terms
+    q = lambda f: vals[min(len(vals) - 1, int(len(vals) * f))] if vals else 0
+    R["density_zones"] = (q(0.25), q(0.75), cut)
     for p, d in dens.items():
         if d >= cut:
             add(p, "dense", "", f"Высокая плотность терминов: {d:.1f} на 100 слов (в среднем по учебнику "
@@ -238,7 +241,8 @@ def locate(words: list, surface: str, used: set[int]) -> list[int]:
 # =============================================================================
 
 def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, header: str,
-                notes: dict | None = None, sources: dict | None = None) -> Image.Image:
+                notes: dict | None = None, sources: dict | None = None,
+                density: dict | None = None) -> Image.Image:
     canvas = Image.new("RGB", CANVAS, "white")
     draw = ImageDraw.Draw(canvas)
     # --- Левая часть: страница учебника --------------------------------------
@@ -303,11 +307,11 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
             lines = wrap(draw, r["text"], f, width - 40)
             blocks.append((r, lines))
             y += len(lines) * (size + 6) + 12
-        if y <= CANVAS[1] - MARGIN - 90:
+        if y <= CANVAS[1] - MARGIN - 90 - DENSITY_BLOCK_H:
             break
     y = MARGIN + 14
     y += draw_textblock(draw, x0, y, header, font(size + 4, True), width) + 14
-    limit = CANVAS[1] - MARGIN - 90
+    limit = CANVAS[1] - MARGIN - 90 - DENSITY_BLOCK_H
     if not blocks:
         draw.text((x0, y), "Замечаний нет.", font=font(21), fill=GREY)
     for i, (r, lines) in enumerate(blocks):
@@ -324,6 +328,8 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
             draw.text((x0 + 38, y), ln, font=f, fill=INK)
             y += size + 6
         y += 12
+    if density is not None:
+        draw_density(draw, x0, CANVAS[1] - MARGIN - 90 - DENSITY_BLOCK_H + 8, width, density)
     legend = ("Термины: розовым — ФРП, зелёным — указатель учебника, жёлтым — словарь терминов; бирюзовым — "
               "новые слова; красная рамка и номер — к слову есть замечание.\n"
               "Числа у термина — упоминания по классам («5:12» — в 5 классе 12 раз): верхние (зелёные) — "
@@ -332,6 +338,83 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
     for i, ln in enumerate(gl):
         draw.text((x0, CANVAS[1] - MARGIN - 12 - (len(gl) - i) * 18), ln, font=font(14), fill=GREY)
     return canvas
+
+
+DENSITY_BLOCK_H = 215
+ZONES = (("низкая", (86, 150, 214)), ("средняя", (110, 180, 90)),
+         ("повышенная", (240, 160, 40)), ("высокая", (215, 45, 45)))
+
+
+def zone_of(value: float, zones: tuple) -> int:
+    q25, q75, q90 = zones
+    return 0 if value < q25 else 1 if value < q75 else 2 if value < q90 else 3
+
+
+def draw_density(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, d: dict) -> None:
+    """
+    Терминологическая плотность страницы и где она на распределении по всем
+    страницам учебника: гистограмма раскрашена по зонам (четверть самых
+    разреженных страниц — низкая, середина — средняя, 75–90 % — повышенная,
+    10 % самых плотных — высокая), маркер — эта страница.
+    """
+    vals, zones, value = d["all"], d["zones"], d["value"]
+    draw.line((x, y - 6, x + width, y - 6), fill=(205, 205, 200), width=1)
+    title_f, f, small = font(19, True), font(17), font(13)
+    draw.text((x, y), "Терминологическая плотность", font=title_f, fill=INK)
+    y += 28
+    if value is None:
+        msg = ("Основного текста параграфа на странице нет (вне параграфа или после «Тренируемся») — "
+               "плотность не считается.")
+        for ln in wrap(draw, msg, f, width):
+            draw.text((x, y), ln, font=f, fill=GREY)
+            y += 23
+    else:
+        z = zone_of(value, zones)
+        name, color = ZONES[z]
+        share = sum(1 for v in vals if v < value) / len(vals) if vals else 0
+        draw.rounded_rectangle((x, y, x + 132, y + 26), radius=6, fill=color)
+        draw.text((x + 66 - draw.textlength(name, font=font(16, True)) / 2, y + 4), name,
+                  font=font(16, True), fill="white")
+        txt = (f"{value:.1f} терминов на 100 слов ({d['terms']} на {d['words']}); "
+               f"выше, чем на {share:.0%} страниц учебника")
+        if d.get("approx"):
+            txt += f". Основного текста мало (меньше {MIN_PAGE_WORDS} слов) — оценка приблизительная"
+        lines = wrap(draw, txt, f, width - 145)
+        for i, ln in enumerate(lines):
+            draw.text((x + 145, y + 3 + i * 21), ln, font=f, fill=INK)
+        y += max(30, len(lines) * 21 + 6)
+    # Гистограмма распределения по страницам
+    if not vals:
+        return
+    hx, hy, hw, hh = x + 4, y + 30, width - 8, 74
+    top = max(vals)
+    bins = 28
+    step = top / bins if top else 1
+    counts = [0] * bins
+    for v in vals:
+        counts[min(bins - 1, int(v / step))] += 1
+    peak = max(counts) or 1
+    bw = hw / bins
+    for i, c in enumerate(counts):
+        center = (i + 0.5) * step
+        col = ZONES[zone_of(center, zones)][1]
+        h = c / peak * (hh - 4)
+        draw.rectangle((hx + i * bw + 1, hy + hh - h, hx + (i + 1) * bw - 1, hy + hh), fill=col)
+    draw.line((hx, hy + hh, hx + hw, hy + hh), fill=(120, 120, 120), width=1)
+    for v in (0, top / 2, top):
+        lab = f"{v:.0f}"
+        px = hx + (v / top if top else 0) * hw
+        draw.text((px - draw.textlength(lab, font=small) / 2, hy + hh + 3), lab, font=small, fill=GREY)
+    draw.text((hx + hw - draw.textlength("терминов на 100 слов", font=small), hy + hh + 17),
+              "терминов на 100 слов", font=small, fill=GREY)
+    draw.text((hx, hy + hh + 17), "число страниц учебника", font=small, fill=GREY)
+    if value is not None:
+        px = hx + min(1.0, value / top if top else 0) * hw
+        draw.line((px, hy - 4, px, hy + hh), fill=INK, width=3)
+        draw.polygon([(px - 7, hy - 12), (px + 7, hy - 12), (px, hy - 3)], fill=INK)
+        lab = "эта страница"
+        lx = min(max(hx, px - draw.textlength(lab, font=small) / 2), hx + hw - draw.textlength(lab, font=small))
+        draw.text((lx, hy - 27), lab, font=small, fill=INK)
 
 
 def draw_textblock(draw, x, y, text, f, width) -> int:
@@ -374,6 +457,11 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         f"  • слово снова встречается после перерыва в {FAR_PAGES}+ страниц — {kinds['far']}",
         f"  • много новых слов на одной странице ({MANY_NEW_ON_PAGE}+) — {kinds['many']}",
         f"  • высокая плотность терминов на странице (10 % самых плотных) — {kinds['dense']}",
+        "",
+        "Внизу справа на каждой странице — терминологическая плотность: сколько вхождений терминов "
+        "приходится на 100 слов основного текста страницы, и гистограмма плотности по всем страницам "
+        "учебника с отметкой этой страницы. Цвет — зона: синяя — низкая (четверть самых разреженных страниц), "
+        "зелёная — средняя, оранжевая — повышенная (75–90 %), красная — высокая (10 % самых плотных).",
         f"  • параграф с высокой плотностью терминов (25 % самых плотных) — {kinds['sec']}",
         "",
         "Определения и пояснения найдены автоматически по шаблонам («X — это…», «…называют X» и т. п.), "
@@ -407,8 +495,16 @@ def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path
         for p in range(1, len(pdf["pages"]) + 1):
             s = sec_of_page.get(p)
             header = f"Страница {p}" + (f" · § {s['num']}. {s['title']}" if s else "")
+            words = R["page_words"].get(p, 0)
+            value = R["page_density"].get(p)
+            approx = value is None and words > 0
+            if approx:
+                # Мало основного текста (подписи, рисунки): плотность считается, но помечается как приблизительная
+                value = R["page_terms"].get(p, 0) / words * 100
+            density = {"value": value, "all": sorted(R["page_density"].values()), "zones": R["density_zones"],
+                       "terms": R["page_terms"].get(p, 0), "words": words, "approx": approx}
             img = render_page(src, pdf, p, marks.get(p, []), recs.get(p, []), header, notes,
-                              a.get("term_sources"))
+                              a.get("term_sources"), density)
             fp = Path(tmp) / f"p{p:04d}.jpg"
             img.save(fp, "JPEG", quality=70)
             files.append(fp)
