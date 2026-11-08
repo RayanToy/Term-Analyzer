@@ -840,10 +840,11 @@ class _Everything:
 
 def textbook_term_counts(grade: int, pre, patterns, shadowed, use_cache: bool = True) -> Counter:
     """Сколько раз каждый термин словаря встретился в учебнике биологии grade класса."""
+    import hashlib
     path = config.GRADE_DOCX[grade]
-    cache = CACHE_DIR / f"textbook_{grade}_terms.json"
-    if (use_cache and cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime
-            and cache.stat().st_mtime >= config.DICT_PATH.stat().st_mtime):
+    digest = hashlib.md5("\n".join(p for v in patterns.values() for p in v).encode("utf-8")).hexdigest()[:10]
+    cache = CACHE_DIR / f"textbook_{grade}_terms_{digest}.json"
+    if use_cache and cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime:
         return Counter(json.loads(cache.read_text(encoding="utf-8")))
     a = h.analyze_document(Document(str(path)), pre, _Everything(), patterns, shadowed, set())
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -910,6 +911,93 @@ class PriorMentions:
 # =============================================================================
 # Отчёт
 # =============================================================================
+
+def short_count(n) -> str:
+    """Компактное число для пометки в тексте: 7, 693, 1,3т, 13т."""
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    if n < 10000:
+        return f"{n / 1000:.1f}".replace(".", ",").replace(",0", "") + "т"
+    return f"{round(n / 1000)}т"
+
+
+def grades_note(c: Counter) -> str:
+    """«5:12 7:3 8:40» — упоминания по классам, классы без упоминаний опущены; «0» — ни разу."""
+    parts = [f"{g}:{short_count(n)}" for g, n in sorted(c.items()) if n]
+    return " ".join(parts) if parts else "0"
+
+
+def term_annotations(a, use_cache: bool = True) -> dict:
+    """
+    Где в тексте поставить у термина числа упоминаний в прошлых классах
+    по классам: сверху — учебники биологии («5:12 7:3»), снизу — все учебники.
+
+    Чтобы не загромождать текст, числа ставятся при первом упоминании
+    термина в учебнике и там, где термин снова появляется после перерыва
+    в FAR_PAGES страниц и больше (такие места ученик мог забыть). Слово
+    внутри более длинного термина («мембрана» в «клеточная мембрана»)
+    отдельной пометки не получает.
+
+    Returns:
+        {"by_para": {абзац: [(позиция конца термина, верхнее, нижнее)]},
+         "by_start": {начало вхождения в потоке: (ключ, верхнее, нижнее)},
+         "bio_span", "all_span", "corpus", "prior", "pm"}
+    """
+    pdf = load_pdf(config.SOURCE_PDF[a.grade], use_cache)
+    pm = PageMap(a, pdf)
+    corpus = Corpus(a.preprocessor.morph, use_cache)
+    sections, _ = parse_toc(pdf)
+    last_section_page = max((sec["end"] for sec in sections), default=len(pdf["pages"]))
+
+    def in_box(pi: int) -> bool:
+        """Абзац в ячейке таблицы или в надписи: там поле с числами не помещается."""
+        tags = {el.tag.rsplit("}", 1)[-1] for el in a.paragraphs[pi]._p.iterancestors()}
+        return bool(tags & {"tc", "txbxContent"})
+
+    occ = defaultdict(list)
+    spans = []
+    for kind, key, s, e in a.occurrences:
+        if kind == "term":
+            occ[key].append((s, e))
+            spans.append((s, e))
+    spans.sort()
+
+    def inside_longer(s: int, e: int) -> bool:
+        i = bisect_left(spans, (s, e))
+        for s2, e2 in spans[max(0, i - 8):i + 8]:
+            if s2 <= s and e <= e2 and (s2, e2) != (s, e):
+                return True
+        return False
+
+    multi = [k for k in occ if " " in k]
+    grade_counts = corpus.counts(multi) if multi else {}
+    prior = PriorMentions(a.grade, a.preprocessor, a.patterns_by_len, a.verb_shadowed, use_cache)
+    by_para, by_start = defaultdict(list), {}
+    for key, lst in occ.items():
+        m = prior.of(key, True, corpus_grades=grade_counts.get(key, {}).get("grade"))
+        sup, sub = grades_note(m["bio"]), grades_note(m["all"])
+        last_page = None
+        for s, e in sorted(lst):
+            page = pm.page_of(s)
+            # Приложения и указатель терминов после последнего параграфа не размечаются
+            if inside_longer(s, e) or (page and page > last_section_page):
+                continue
+            if last_page is None or (page and page - last_page >= FAR_PAGES):
+                rng = a.stream.to_paragraphs(max(s, e - 1), e)
+                if rng and not in_box(rng[-1][0]):
+                    pi, _, pe = rng[-1]
+                    by_para[pi].append((pe, sup, sub))
+                    by_start[s] = (key, sup, sub)
+            if page:
+                last_page = page
+    bio_grades = prior.bio_grades
+    return {
+        "by_para": by_para, "by_start": by_start, "corpus": corpus, "prior": prior, "pm": pm,
+        "bio_span": f"{bio_grades[0]}–{bio_grades[-1]}" if bio_grades else "",
+        "all_span": f"2–{a.grade - 1}",
+    }
+
 
 def distances(idx: list[int], pages: list[int | None]) -> tuple[int | str, str, int]:
     """(среднее расстояние, наибольший разрыв «N (с. A → с. B)», разрыв в страницах)."""
@@ -1102,7 +1190,7 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
         bio, where = corpus.subject_profile(R["subj"][k]["subj"])
         term_rows.append([
             k, len(R["term_occ"][k]), pages_str(inf["pages"]), inf["avg"], inf["gap"],
-            "да" if k in a.new_terms else "", bio, where,
+            "да" if k in a.new_terms else "", dict_names(a, k), bio, where,
             d["status"], (f"с. {d['page']}: {d['text']}" if d["text"] else ""),
             R["other_defs"].get(k, "") if k in a.new_terms else "", "; ".join(d["figures"]),
             *prior_cells(m), m["last"] or "", prior.verdict(m),
@@ -1110,7 +1198,7 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
     terms_df = pd.DataFrame(term_rows, columns=[
         "Термин (слова в начальной форме)", "Вхождений в учебнике", "Страницы",
         "Среднее расстояние между вхождениями, слов", "Наибольший разрыв между вхождениями, слов (страницы)",
-        "Есть незнакомое ученику слово", "Биологический термин", "Частота по предметам (на млн слов)",
+        "Есть незнакомое ученику слово", "Словари", "Биологический термин", "Частота по предметам (на млн слов)",
         "Определение в учебнике", "Текст определения (страница)", "Определение в других учебниках",
         "Рисунок (где слово показано или упомянуто рядом)",
         BIO_COL, ALL_COL, BY_COL, "Последний раз встречался, класс", "Помнит ли ученик",
@@ -1157,7 +1245,8 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
         ["  из них с незнакомым ученику словом", len(a.new_terms)],
         ["  из них биологических", int((terms_df["Биологический термин"] == "да").sum())],
         ["Терминов найдено (всего вхождений в учебнике)", sum(a.stats_terms.values())],
-        ["Терминов в словаре (после приведения к начальной форме)", a.patterns_total],
+        ["Терминов в словарях (после приведения к начальной форме)", a.patterns_total],
+        *dictionary_summary(a),
         ["Параграфов", len(R["sections"])],
         ["Параграфы с высокой плотностью терминов", ", ".join(high)],
         ["Не выделено: мусор распознавания (лемм)", sum(1 for w in a.stats_skipped if w in a.junk)],
@@ -1187,6 +1276,7 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
         new_df.to_excel(w, sheet_name="Новые слова", index=False)
         terms_df.to_excel(w, sheet_name="Термины", index=False)
         sec_df.to_excel(w, sheet_name="Параграфы", index=False)
+        dictionaries_df(a, R).to_excel(w, sheet_name="Словари", index=False)
         skipped_df.to_excel(w, sheet_name="Не выделено", index=False)
         pd.DataFrame([r[:6] for r in check_rows], columns=CHECK_COLUMNS).to_excel(
             w, sheet_name="Проверка определений", index=False)
@@ -1197,12 +1287,64 @@ def write_excel_report(a, out_path: Path, pdf_path: Path | None = None, corpus: 
     return R
 
 
+def dict_names(a, key: str) -> str:
+    """«ФРП, указатель учебника, словарь терминов» — в каких словарях термин."""
+    import term_dictionaries as td
+    srcs = (a.get("term_sources") or {}).get(key, frozenset({"dict"}))
+    return ", ".join(td.SOURCE_NAMES[s] for s in td.SOURCES if s in srcs)
+
+
+def dictionary_summary(a) -> list[list]:
+    import term_dictionaries as td
+    sources = a.get("term_sources") or {}
+    found = a.stats_terms
+    rows = []
+    for src in td.SOURCES:
+        pats = [p for p, ss in sources.items() if src in ss]
+        if not pats:
+            continue
+        hit = [p for p in pats if found.get(p)]
+        rows.append([f"Словарь «{td.SOURCE_NAMES[src]}»: терминов / найдено в учебнике", f"{len(pats)} / {len(hit)}"])
+    return rows
+
+
+def dictionaries_df(a, R) -> pd.DataFrame:
+    """
+    Термины указателя и ФРП: встречается ли термин в учебнике, сколько раз,
+    на каких страницах и в каких ещё словарях он есть.
+    """
+    import term_dictionaries as td
+    sources = a.get("term_sources") or {}
+    term_of = a.get("term_of") or {}
+    rows = []
+    for src in ("frp", "index"):
+        for (s, pat), term in term_of.items():
+            if s != src or term in td.SEARCH_ONLY:
+                continue
+            occ = R["term_info"].get(pat)
+            n = len(R["term_occ"].get(pat, []))
+            others = ", ".join(td.SOURCE_NAMES[o] for o in td.SOURCES if o in sources.get(pat, ()) and o != src)
+            rows.append([td.SOURCE_NAMES[src], term, n, pages_str(occ["pages"]) if occ else "",
+                         "" if n else "в учебнике не встречается", others])
+    df = pd.DataFrame(rows, columns=["Словарь", "Термин", "Вхождений в учебнике", "Страницы", "Замечание",
+                                     "Есть также в словарях"])
+    return df.sort_values(["Словарь", "Вхождений в учебнике", "Термин"], ascending=[True, True, True])
+
+
 def guide_rows(a, bio_span: str, all_span: str, morph) -> list[list[str]]:
     return [
         ["Сводка", "Итоговые числа по учебнику."],
         ["Новые слова", "Слова, выделенные бирюзовым: в прошлых классах встречались меньше "
                         f"{a.min_freq} раз. Разные падежные формы одного слова собраны в одну строку."],
-        ["Термины", "Термины из словаря, выделенные жёлтым."],
+        ["Термины", "Термины из трёх словарей: общего словаря терминов (жёлтый), указателя терминов в конце "
+                    "учебника (зелёный) и ФРП — федеральной рабочей программы, то есть того, что требуется от "
+                    "ученика (розовый). Если термин в нескольких словарях, фон — по старшему словарю (ФРП, затем "
+                    "указатель, затем словарь), подчёркивание — цветом второго словаря, двойное — во всех трёх. "
+                    "Столбец «Словари» перечисляет, где термин есть."],
+        ["Словари", "Все термины указателя и ФРП: сколько раз и на каких страницах термин встречается в "
+                    "учебнике. «в учебнике не встречается» — термин из словаря в тексте не найден (для ФРП это "
+                    "значит, что требуемое программой понятие в учебнике не употребляется — или употребляется в "
+                    "другой форме, которую стоит проверить)."],
         ["Параграфы", "Плотность терминов и новых слов по параграфам (см. ниже, как определены границы)."],
         ["Не выделено", "Слова, которые формально редкие, но не выделены: мусор распознавания, "
                         "знакомые ученику слова, слова, образованные от знакомых."],
@@ -1278,14 +1420,15 @@ def format_workbook(path: Path, check_rows: list | None = None) -> None:
     widths = {
         "Сводка": [60, 70],
         "Новые слова": [24, 34, 11, 22, 14, 22, 20, 70, 70, 20, 14, 34, 13, 13, 30, 14],
-        "Термины": [32, 11, 30, 14, 22, 13, 12, 34, 20, 70, 60, 20, 13, 13, 30, 13, 22],
+        "Термины": [32, 11, 30, 14, 22, 13, 26, 12, 34, 20, 70, 60, 20, 13, 13, 30, 13, 22],
         "Параграфы": [9, 40, 12, 18, 11, 11, 10, 10, 11, 11, 10, 11, 14, 50, 50],
         "Не выделено": [26, 12, 22, 40],
         "Проверка определений": [26, 18, 24, 18, 9, 130],
+        "Словари": [20, 42, 12, 30, 28, 34],
         "Пояснения": [36, 120],
     }
     wrap_cols = {
-        "Новые слова": {2, 8, 9, 10, 12, 15}, "Термины": {3, 10, 11, 12, 8, 15}, "Параграфы": {2, 14, 15},
+        "Новые слова": {2, 8, 9, 10, 12, 15}, "Термины": {3, 7, 9, 11, 12, 13, 16}, "Словари": {2, 4, 6}, "Параграфы": {2, 14, 15},
         "Пояснения": {2}, "Сводка": {2}, "Проверка определений": {4, 6},
     }
     for ws in wb.worksheets:
@@ -1317,13 +1460,15 @@ def analyze(grade: int, min_freq: int, use_cache: bool = True):
     known, sources = h.known_lemmas(grade, "both", pre, use_cache=use_cache, min_freq=min_freq)
     junk = h.load_not_new_words(config.NOT_NEW_WORDS_PATH)
     familiar = h.load_not_new_words(config.FAMILIAR_WORDS_PATH)
-    patterns, shadowed = h.load_patterns(config.DICT_PATH, pre)
+    import term_dictionaries
+    patterns, shadowed, term_sources, term_lists, term_of = term_dictionaries.load_all_patterns(grade, pre)
     in_path = config.SOURCE_DOCX[grade]
-    a = h.analyze_document(Document(str(in_path)), pre, known, patterns, shadowed, junk | familiar)
+    a = h.analyze_document(Document(str(in_path)), pre, known, patterns, shadowed, junk | familiar,
+                           term_sources=term_sources)
     a.update(
         in_path=Path(in_path), grade=grade, min_freq=min_freq, known=known, sources=sources, junk=junk,
         patterns_by_len=patterns, patterns_total=sum(len(v) for v in patterns.values()), preprocessor=pre,
-        verb_shadowed=shadowed,
+        verb_shadowed=shadowed, term_sources=term_sources, term_lists=term_lists, term_of=term_of,
         new_terms={t for t in a.stats_terms if any(not h.is_familiar(l, known, pre) for l in t.split())},
     )
     return a

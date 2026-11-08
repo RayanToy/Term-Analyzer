@@ -40,6 +40,7 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_COLOR_INDEX
+from docx.shared import Pt, RGBColor
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 
@@ -731,6 +732,7 @@ def compute_spans(
     stats_derived: dict | None = None,
     occurrences: list | None = None,
     common_lemmas: set[str] | None = None,
+    term_sources: dict[str, frozenset] | None = None,
 ) -> list[tuple[int, int, WD_COLOR_INDEX]]:
     """
     Вычисляет интервалы терминов и новых слов за одну токенизацию.
@@ -775,6 +777,7 @@ def compute_spans(
     # Термины
     # ------------------------------------------------------------------
     term_spans: list[tuple[int, int]] = []
+    span_keys: list[tuple[int, int, str]] = []   # для словарей термина
 
     unis = set(patterns_by_len.get(1, []))
     if unis:
@@ -791,6 +794,7 @@ def compute_spans(
             if _is_non_term_usage(tokens, w, verb_shadowed or {}, preprocessor):
                 continue
             term_spans.append((w['start'], w['end']))
+            span_keys.append((w['start'], w['end'], key))
             stats_terms[key] += 1
             if occurrences is not None:
                 occurrences.append(('term', key, w['start'], w['end']))
@@ -806,6 +810,7 @@ def compute_spans(
             if phrase not in patset:
                 continue
             term_spans.append((words[i]['start'], words[i + k - 1]['end']))
+            span_keys.append((words[i]['start'], words[i + k - 1]['end'], phrase))
             stats_terms[phrase] += 1
             if occurrences is not None:
                 occurrences.append(('term', phrase, words[i]['start'], words[i + k - 1]['end']))
@@ -869,7 +874,18 @@ def compute_spans(
 
     new_spans = merge_spans(new_spans)
 
-    colored = [(s, e, COLOR_TERM) for s, e in term_spans]
+    if term_sources:
+        # Стиль слитого интервала — по всем словарям вошедших в него терминов
+        import term_dictionaries
+        colored = []
+        for ms, me in term_spans:
+            srcs = set()
+            for s_, e_, key in span_keys:
+                if s_ < me and e_ > ms:
+                    srcs |= term_sources.get(key, frozenset({'dict'}))
+            colored.append((ms, me, term_dictionaries.style_for(srcs)))
+    else:
+        colored = [(s, e, COLOR_TERM) for s, e in term_spans]
     colored += [(s, e, COLOR_NEW) for s, e in new_spans]
     colored.sort(key=lambda x: x[0])
     return colored
@@ -1228,6 +1244,118 @@ def apply_colors_to_paragraph(
     return painted
 
 
+NOTE_BIO_COLOR = '1E7B34'   # верхнее число — учебники биологии
+NOTE_ALL_COLOR = '1F4E9A'   # нижнее число — все учебники
+NOTE_FONT_PT = 6            # размер чисел у термина
+
+
+def add_annotations(paragraph: Paragraph, notes: list[tuple[int, str, str]]) -> int:
+    """
+    Ставит после термина два маленьких числа: надстрочное (сколько раз
+    термин встречался в учебниках биологии прошлых классов) и подстрочное
+    (во всех учебниках прошлых классов).
+
+    Позиции считаются по тексту абзаца, который раскраска не меняет
+    (runs только режутся), поэтому вызывать можно после apply_colors.
+    Пометки ставятся с конца абзаца, чтобы позиции не сдвигались.
+
+    Args:
+        paragraph: абзац
+        notes: [(позиция конца термина в тексте абзаца, верхнее, нижнее), ...]
+
+    Returns:
+        Сколько пометок поставлено
+    """
+    done = 0
+    for off, sup, sub in sorted(notes, reverse=True):
+        pos = 0
+        for run in list(paragraph.runs):
+            r_start, r_end = pos, pos + len(run.text)
+            pos = r_end
+            if not (r_start < off <= r_end):
+                continue
+            if any(child.tag not in SAFE_RUN_CHILDREN for child in run._element):
+                break
+            target = run
+            if off < r_end:
+                # Термин кончается внутри run — режем его на две части
+                k = off - r_start
+                _replace_run(run, [(run.text[:k], None), (run.text[k:], None)])
+                # исходный run удалён; нужна часть, которая кончается на off
+                target = _run_ending_at(paragraph, off)
+                if target is None:
+                    break
+            anchor = target._element
+            for el in reversed(_stacked_note_runs(anchor, paragraph, sup, sub)):
+                anchor.addnext(el)
+            done += 1
+            break
+    return done
+
+
+def _eq_escape(text: str) -> str:
+    """
+    Убирает из текста символы, которые поле EQ понимает как разметку:
+    скобки, «;» и обратную косую черту. Запятую в «1,3т» русский Word
+    показывает как есть, а экранированная «\\,» ломает поле.
+    """
+    return re.sub(r'[\\();]', '', text)
+
+
+def _stacked_note_runs(anchor, paragraph: Paragraph, sup: str, sub: str) -> list:
+    """
+    Runs поля EQ, которое ставит две строки друг над другом, выровненные
+    влево: { EQ \\o\\al(\\s\\up3(верхняя);\\s\\do2(нижняя)) }. Так пометка
+    занимает ширину одной, более длинной строки, а не двух подряд.
+    Цвет и размер берутся из форматирования кода поля. Разделитель
+    элементов «;» — как в русской версии Word.
+    """
+    def run(fld: str | None = None, instr: str | None = None, color: str | None = None):
+        el = deepcopy(anchor)
+        for child in list(el):
+            if child.tag != qn('w:rPr'):
+                el.remove(child)
+        r = Run(el, paragraph)
+        r.font.highlight_color = None
+        r.font.bold = True
+        r.font.superscript = False
+        r.font.subscript = False
+        r.font.underline = False
+        r.font.size = Pt(NOTE_FONT_PT)
+        r.font.color.rgb = RGBColor.from_string(color or NOTE_ALL_COLOR)
+        if fld:
+            f = OxmlElement('w:fldChar')
+            f.set(qn('w:fldCharType'), fld)
+            el.append(f)
+        if instr is not None:
+            t = OxmlElement('w:instrText')
+            t.set(qn('xml:space'), 'preserve')
+            t.text = instr
+            el.append(t)
+        return el
+
+    return [
+        run(fld='begin'),
+        run(instr=' EQ \\o\\al(\\s\\up3('),
+        run(instr=_eq_escape(sup), color=NOTE_BIO_COLOR),
+        run(instr=');\\s\\do2('),
+        run(instr=_eq_escape(sub), color=NOTE_ALL_COLOR),
+        run(instr=')) '),
+        run(fld='end'),
+    ]
+
+
+def _run_ending_at(paragraph: Paragraph, off: int) -> Run | None:
+    pos = 0
+    for run in paragraph.runs:
+        pos += len(run.text)
+        if pos == off:
+            return run
+        if pos > off:
+            return None
+    return None
+
+
 def _replace_run(run: Run, pieces: list[tuple[str, WD_COLOR_INDEX | None]]) -> None:
     """
     Заменяет run набором новых runs с тем же rPr и заданными цветами.
@@ -1251,9 +1379,26 @@ def _replace_run(run: Run, pieces: list[tuple[str, WD_COLOR_INDEX | None]]) -> N
 
         el.addprevious(new_el)
         if color is not None:
-            Run(new_el, run._parent).font.highlight_color = color
+            _apply_style(Run(new_el, run._parent), color)
 
     parent.remove(el)
+
+
+def _apply_style(run: Run, style) -> None:
+    """Цвет фона или стиль словарей (фон, цвет подчёркивания | None, двойное)."""
+    if not isinstance(style, tuple):
+        run.font.highlight_color = style
+        return
+    bg, ucolor, double = style
+    run.font.highlight_color = bg
+    if ucolor:
+        rpr = run._element.get_or_add_rPr()
+        for old in rpr.findall(qn('w:u')):
+            rpr.remove(old)
+        u = OxmlElement('w:u')
+        u.set(qn('w:val'), 'double' if double else 'thick')
+        u.set(qn('w:color'), ucolor)
+        rpr.append(u)
 
 
 def _append_run_content(run_el, text: str) -> None:
@@ -1444,13 +1589,15 @@ def highlight_textbook(
     junk = load_not_new_words(not_new_path)
     familiar = load_not_new_words(familiar_path)
     not_new = junk | familiar
-    patterns_by_len, verb_shadowed = load_patterns(dict_path, preprocessor)
+    import term_dictionaries
+    patterns_by_len, verb_shadowed, term_sources, term_lists, term_of = \
+        term_dictionaries.load_all_patterns(grade, preprocessor)
     patterns_total = sum(len(v) for v in patterns_by_len.values())
 
     doc = Document(str(in_path))
     a = analyze_document(
         doc, preprocessor, prev, patterns_by_len, verb_shadowed, not_new,
-        include_propn=include_propn,
+        include_propn=include_propn, term_sources=term_sources,
     )
     t0 = a.t0
     paragraphs, stream = a.paragraphs, a.stream
@@ -1458,12 +1605,30 @@ def highlight_textbook(
     stats_new, stats_terms = a.stats_new, a.stats_terms
     stats_skipped, stats_derived = a.stats_skipped, a.stats_derived
 
+    import textbook_report
+    a.update(
+        in_path=in_path, grade=grade, min_freq=min_freq, known=prev, sources=sources,
+        junk=junk, patterns_by_len=patterns_by_len, patterns_total=patterns_total,
+        preprocessor=preprocessor,
+        verb_shadowed=verb_shadowed, term_sources=term_sources, term_lists=term_lists, term_of=term_of,
+        new_terms={
+            term for term in stats_terms
+            if any(not is_familiar(l, prev, preprocessor) for l in term.split())
+        },
+    )
+    # Пометки у терминов: сколько раз термин встречался в прошлых классах
+    notes = textbook_report.term_annotations(a)
+
     painted = 0
     for pi, spans in colored_by_para.items():
         painted += apply_colors_to_paragraph(paragraphs[pi], sorted(spans, key=lambda x: x[0]))
+    noted = 0
+    for pi, items in notes["by_para"].items():
+        noted += add_annotations(paragraphs[pi], items)
+    print(f"[Пометки] Чисел упоминаний у терминов: {noted}")
 
     if add_legend and doc.paragraphs:
-        _add_legend(doc.paragraphs[0], grade, base_descr)
+        _add_legend(doc.paragraphs[0], grade, base_descr, notes["bio_span"], notes["all_span"])
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(out_path))
@@ -1494,20 +1659,10 @@ def highlight_textbook(
     print(f"[Готово] Файл: {out_path}  ({round(time.time() - t0)} с)")
 
     # Подробный отчёт: страницы, расстояния, определения, параграфы и т. д.
-    import textbook_report
-    a.update(
-        in_path=in_path, grade=grade, min_freq=min_freq, known=prev, sources=sources,
-        junk=junk, patterns_by_len=patterns_by_len, patterns_total=patterns_total,
-        preprocessor=preprocessor,
-        verb_shadowed=verb_shadowed,
-        new_terms={
-            term for term in stats_terms
-            if any(not is_familiar(l, prev, preprocessor) for l in term.split())
-        },
-    )
     textbook_report.write_excel_report(
         a,
         HIGHLIGHT_DIR / f"Порог {min_freq}" / f"{_output_stem(in_path)}_отчёт_порог{min_freq}.xlsx",
+        corpus=notes["corpus"],
     )
     return out_path
 
@@ -1527,6 +1682,7 @@ def analyze_document(
     not_new: set[str],
     include_propn: bool = False,
     pretokenized: Analysis | None = None,
+    term_sources: dict | None = None,
 ) -> Analysis:
     """
     Находит в документе термины и новые слова, не меняя его.
@@ -1547,7 +1703,7 @@ def analyze_document(
         stream, blocks = pretokenized.stream, pretokenized.blocks
         common_lemmas = pretokenized.common_lemmas
         return _spans_pass(t0, paragraphs, texts, stream, blocks, common_lemmas, preprocessor,
-                           prev, patterns_by_len, verb_shadowed, not_new, include_propn)
+                           prev, patterns_by_len, verb_shadowed, not_new, include_propn, term_sources)
     paragraphs = list(iter_paragraphs(doc))
     texts = [paragraph_run_text(p) for p in paragraphs]
     drop_caps = TextStream.find_drop_caps(texts, preprocessor.morph)
@@ -1567,11 +1723,11 @@ def analyze_document(
         if t.get('pos') in NEW_WORD_POS and t.get('lemma')
     }
     return _spans_pass(t0, paragraphs, texts, stream, blocks, common_lemmas, preprocessor,
-                       prev, patterns_by_len, verb_shadowed, not_new, include_propn)
+                       prev, patterns_by_len, verb_shadowed, not_new, include_propn, term_sources)
 
 
 def _spans_pass(t0, paragraphs, texts, stream, blocks, common_lemmas, preprocessor,
-                prev, patterns_by_len, verb_shadowed, not_new, include_propn) -> Analysis:
+                prev, patterns_by_len, verb_shadowed, not_new, include_propn, term_sources=None) -> Analysis:
     """Поиск терминов и новых слов по готовым токенам (см. analyze_document)."""
     a = Analysis(
         t0=t0, paragraphs=paragraphs, texts=texts, stream=stream, blocks=blocks,
@@ -1597,6 +1753,7 @@ def _spans_pass(t0, paragraphs, texts, stream, blocks, common_lemmas, preprocess
             raw_text=stream.text[b_start:b_end],
             occurrences=occ,
             common_lemmas=common_lemmas,
+            term_sources=term_sources,
         )
         a.occurrences.extend((kind, key, b_start + s, b_start + e) for kind, key, s, e in occ)
         for s, e, color in colored:
@@ -1633,22 +1790,51 @@ def load_not_new_words(path: str | Path) -> set[str]:
     return words
 
 
-def _add_legend(first_paragraph: Paragraph, grade: int, base_descr: str) -> None:
+def _add_legend(first_paragraph: Paragraph, grade: int, base_descr: str,
+                bio_span: str = '', all_span: str = '') -> None:
     """Вставляет перед первым абзацем пояснение к цветам."""
     legend_el = OxmlElement('w:p')
     first_paragraph._element.addprevious(legend_el)
     legend = Paragraph(legend_el, first_paragraph._parent)
 
-    run = legend.add_run("Подсветка: ")
+    import term_dictionaries as td
+    run = legend.add_run("Подсветка терминов: ")
     run.bold = True
-    run = legend.add_run("жёлтый — термины из словаря")
-    run.font.highlight_color = COLOR_TERM
-    legend.add_run("; ")
+    for src, label in (("frp", "розовый — термины ФРП (рабочей программы)"),
+                       ("index", "зелёный — указатель терминов учебника"),
+                       ("dict", "жёлтый — общий словарь терминов")):
+        run = legend.add_run(label)
+        run.font.highlight_color = td.HIGHLIGHT[src]
+        legend.add_run("; ")
+    legend.add_run("термин из нескольких словарей: фон — по старшему (ФРП, затем указатель, затем словарь), "
+                   "подчёркивание — цветом второго словаря (")
+    for src, word in (("frp", "розовое"), ("index", "зелёное"), ("dict", "жёлтое")):
+        run = legend.add_run(word)
+        _apply_style(run, (None, td.UNDERLINE_COLOR[src], False))
+        legend.add_run(", " if src != "dict" else "), ")
+    run = legend.add_run("двойное")
+    _apply_style(run, (None, td.ALL_THREE_COLOR, True))
+    legend.add_run(" — во всех трёх словарях. ")
     run = legend.add_run(
         f"бирюзовый — слова, новые для ученика {grade} класса: "
         f"{base_descr}"
     )
     run.font.highlight_color = COLOR_NEW
+    if bio_span:
+        legend.add_run(
+            ". Числа у термина (при первом упоминании и там, где он снова появляется после "
+            "перерыва в 20 и больше страниц) — сколько раз термин встречался в прошлых классах, "
+            "по классам: «5:12» значит «в 5 классе 12 раз». "
+        )
+        run = legend.add_run("Верхняя строка")
+        run.font.color.rgb = RGBColor.from_string(NOTE_BIO_COLOR)
+        run.bold = True
+        legend.add_run(f" — учебники биологии {bio_span} классов, ")
+        run = legend.add_run("нижняя")
+        run.font.color.rgb = RGBColor.from_string(NOTE_ALL_COLOR)
+        run.bold = True
+        legend.add_run(f" — все школьные учебники {all_span} классов. Классы, где термина не было, "
+                       f"не показаны; «0» — не встречался ни разу; «т» — тысяч.")
 
 
 def main() -> None:

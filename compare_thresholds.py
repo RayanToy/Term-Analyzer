@@ -55,7 +55,7 @@ def grouped_new(a, pm, morph):
 
 pre = TextPreprocessorWithoutStopwords(stopwords_path=config.STOPWORDS_PATH, replacements_path=config.REPLACEMENTS_PATH)
 morph = pre.morph
-patterns, shadowed = h.load_patterns(config.DICT_PATH, pre)
+import term_dictionaries
 corpus = tr.Corpus(morph)
 excl = h.load_not_new_words(config.NOT_NEW_WORDS_PATH) | h.load_not_new_words(config.FAMILIAR_WORDS_PATH)
 
@@ -91,10 +91,12 @@ for grade, path in config.SOURCE_DOCX.items():
                 by_grade[w][g] = n
 
     doc = Document(str(path))
+    patterns, shadowed, term_sources, _, _ = term_dictionaries.load_all_patterns(grade, pre)
     results, base = {}, None
     for th in THRESHOLDS:
         known, _ = h.known_lemmas(grade, "both", pre, min_freq=th)
-        a = h.analyze_document(doc, pre, known, patterns, shadowed, excl, pretokenized=base)
+        a = h.analyze_document(doc, pre, known, patterns, shadowed, excl, pretokenized=base,
+                               term_sources=term_sources)
         base = base or a
         new_terms = {t for t in a.stats_terms if any(not h.is_familiar(w, known, pre) for w in t.split())}
         results[th] = (known, a, new_terms)

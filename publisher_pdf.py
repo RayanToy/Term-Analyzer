@@ -24,13 +24,21 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont
 
 import config
-from textbook_report import FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc
+from textbook_report import FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc, term_annotations
 
 DPI = 150
 CANVAS = (int(11.69 * DPI), int(8.27 * DPI))      # A4 альбомная
 MARGIN = 28
 FONT_DIR = Path(r"C:\Windows\Fonts")
 YELLOW = (255, 226, 0, 120)
+PINK = (255, 80, 170, 105)
+GREEN = (40, 220, 70, 100)
+
+
+def term_fill(sources: dict | None, key: str):
+    """Фон термина как в Word: ФРП — розовый, указатель — зелёный, словарь — жёлтый."""
+    srcs = (sources or {}).get(key, ())
+    return PINK if "frp" in srcs else GREEN if "index" in srcs else YELLOW
 TURQUOISE = (0, 205, 215, 110)
 RED = (220, 30, 30, 255)
 PURPLE = (120, 60, 170)
@@ -84,10 +92,19 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
 
     # --- Новые слова и термины с незнакомым словом без определения ------------
     items = [("new", k, R["new_defs"][k], R["new_info"][k]) for k in R["new_occ"]]
-    items += [("term", k, R["term_defs"][k], R["term_info"][k]) for k in R["term_occ"] if k in a.new_terms]
+    sources = a.get("term_sources") or {}
+    is_frp = lambda k: "frp" in sources.get(k, ())
+    items += [("term", k, R["term_defs"][k], R["term_info"][k]) for k in R["term_occ"]
+              if k in a.new_terms or is_frp(k)]
     for kind, k, d, inf in items:
         first = d["first_page"]
-        what = f"новое слово «{k}»" if kind == "new" else f"термин «{k}» (в нём незнакомое ученику слово)"
+        if kind == "new":
+            what = f"новое слово «{k}»"
+        elif is_frp(k):
+            what = f"термин ФРП «{k}» (требуется рабочей программой" + (
+                ", в нём незнакомое ученику слово)" if k in a.new_terms else ")")
+        else:
+            what = f"термин «{k}» (в нём незнакомое ученику слово)"
         sample = R["other_defs"].get(k, "")
         sample_txt = f"\nОбразец из другого учебника — {sample}" if sample else ""
         if d["status"] == "нет":
@@ -116,16 +133,20 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
                 add(y, "far", k, f"«{k}» снова встречается через {y - x} стр. (до этого — с. {x}). "
                                  f"Напомнить значение слова.")
 
-    # --- Давно не встречавшиеся термины ----------------------------------------
+    # --- Термины без определения, которые ученик может не помнить --------------
     prior = R["prior"]
     for k, m in R["term_prior"].items():
-        if k in a.new_terms or not m["last"] or a.grade - m["last"] < LONG_GAP_YEARS:
+        if k in a.new_terms or is_frp(k) or R["term_defs"][k]["status"] == "есть":
             continue
-        if R["term_defs"][k]["status"] == "есть":
+        verdict = prior.verdict(m)
+        if not verdict.startswith(("не встречалось", "редко", "давно", "в биологии давно")):
             continue
-        first = R["term_defs"][k]["first_page"]
-        add(first, "old", k, f"Термин «{k}» в прошлый раз встречался в {m['last']} классе "
-                             f"({int(sum(m['all'].values()))} раз за все годы). Напомнить значение.")
+        bio, allc = int(sum(m["bio"].values())), int(sum(m["all"].values()))
+        last = f", последний раз в {m['last']} кл." if m["last"] else ""
+        add(R["term_defs"][k]["first_page"], "old", k,
+            f"Термин «{k}»: определения в учебнике нет, а ученик может его не помнить — в прошлых "
+            f"классах встречался в учебниках биологии {bio} раз, во всех учебниках {allc} раз{last}. "
+            f"Дать определение или напомнить значение.", True)
 
     # --- Плотность по страницам -------------------------------------------------
     word_sec = R["word_sec"]
@@ -183,7 +204,7 @@ def page_marks(a, R) -> dict[int, list[tuple[str, str, str]]]:
             for (s, e), p in zip(lst, info[k]["pages"]):
                 if p:
                     marks[p].append((s, kind, k, text[s:e]))
-    return {p: [(kind, k, surf) for _, kind, k, surf in sorted(v)] for p, v in marks.items()}
+    return {p: [(s, kind, k, surf) for s, kind, k, surf in sorted(v)] for p, v in marks.items()}
 
 
 def locate(words: list, surface: str, used: set[int]) -> list[int]:
@@ -216,7 +237,8 @@ def locate(words: list, surface: str, used: set[int]) -> list[int]:
 # Вёрстка
 # =============================================================================
 
-def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, header: str) -> Image.Image:
+def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, header: str,
+                notes: dict | None = None, sources: dict | None = None) -> Image.Image:
     canvas = Image.new("RGB", CANVAS, "white")
     draw = ImageDraw.Draw(canvas)
     # --- Левая часть: страница учебника --------------------------------------
@@ -234,13 +256,26 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
         if r["key"] and r["key"] not in numbered:
             numbered[r["key"]] = r["n"]
     badge_done = set()
-    for kind, key, surface in marks:
+    notes = notes or {}
+    note_font = font(12, True)
+    for start, kind, key, surface in marks:
         idx = locate(words, surface, used)
         used.update(idx)
+        note = notes.get(start)
+        if idx and note:
+            # Числа упоминаний в прошлых классах, как в Word: сверху — биология, снизу — все учебники
+            _, _, sup, sub = (None, *note)
+            _, nx0, ntop, nx1, nbottom = words[idx[-1]]
+            x = nx1 * scale + 2
+            for text, y, color in ((sup, ntop * scale - 9, (30, 123, 52, 255)),
+                                   (sub, nbottom * scale - 6, (31, 78, 154, 255))):
+                w = od.textlength(text, font=note_font)
+                od.rectangle((x - 1, y + 1, x + w + 1, y + 13), fill=(255, 255, 255, 200))
+                od.text((x, y - 1), text, font=note_font, fill=color)
         for j in idx:
             _, x0, top, x1, bottom = words[j]
             box = (x0 * scale - 1, top * scale - 1, x1 * scale + 1, bottom * scale + 1)
-            od.rectangle(box, fill=YELLOW if kind == "term" else TURQUOISE)
+            od.rectangle(box, fill=term_fill(sources, key) if kind == "term" else TURQUOISE)
             if key in framed and key not in badge_done:
                 od.rectangle(box, outline=RED, width=3)
         if idx and key in numbered and key not in badge_done:
@@ -268,11 +303,13 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
             lines = wrap(draw, r["text"], f, width - 40)
             blocks.append((r, lines))
             y += len(lines) * (size + 6) + 12
-        if y <= CANVAS[1] - MARGIN - 40:
+        if y <= CANVAS[1] - MARGIN - 90:
             break
     y = MARGIN + 14
     y += draw_textblock(draw, x0, y, header, font(size + 4, True), width) + 14
-    limit = CANVAS[1] - MARGIN - 40
+    limit = CANVAS[1] - MARGIN - 90
+    if not blocks:
+        draw.text((x0, y), "Замечаний нет.", font=font(21), fill=GREY)
     for i, (r, lines) in enumerate(blocks):
         h = len(lines) * (size + 6)
         if y + h > limit:
@@ -287,8 +324,13 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
             draw.text((x0 + 38, y), ln, font=f, fill=INK)
             y += size + 6
         y += 12
-    legend = "Жёлтым — термины, бирюзовым — новые слова, красная рамка и номер — к слову есть замечание."
-    draw.text((x0, CANVAS[1] - MARGIN - 26), legend, font=font(15), fill=GREY)
+    legend = ("Термины: розовым — ФРП, зелёным — указатель учебника, жёлтым — словарь терминов; бирюзовым — "
+              "новые слова; красная рамка и номер — к слову есть замечание.\n"
+              "Числа у термина — упоминания по классам («5:12» — в 5 классе 12 раз): верхние (зелёные) — "
+              "учебники биологии, нижние (синие) — все учебники прошлых классов.")
+    gl = wrap(draw, legend, font(14), width)
+    for i, ln in enumerate(gl):
+        draw.text((x0, CANVAS[1] - MARGIN - 12 - (len(gl) - i) * 18), ln, font=font(14), fill=GREY)
     return canvas
 
 
@@ -312,18 +354,23 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         for r in lst:
             kinds[r["kind"]] += 1
     lines = [
-        "Слева — страница учебника: жёлтым выделены термины из словаря, бирюзовым — новые для ученика слова "
+        "Слева — страница учебника. Термины: розовым — из ФРП (рабочей программы), зелёным — из указателя "
+        "терминов учебника, жёлтым — из общего словаря терминов; бирюзовым — новые для ученика слова "
         f"(в прошлых классах встречались меньше {a.min_freq} раз). Красной рамкой и номером отмечены слова, "
         "к которым относится замечание справа.",
         "",
-        f"Страниц с замечаниями: {len(recs)} из {n_pages_total}. Страницы без замечаний в черновик не включены.",
+        f"В черновике все {n_pages_total} страниц учебника; замечания есть на {len(recs)} из них.",
+        "Числа у термина (при первом упоминании и после перерыва в 20 и больше страниц) — упоминания в прошлых "
+        "классах по классам, «5:12» — в 5 классе 12 раз: верхняя строка, зелёная — учебники биологии, нижняя, "
+        "синяя — все школьные учебники. Классы без упоминаний не показаны, «0» — ни разу, «т» — тысяч.",
         "",
         "Виды замечаний:",
         f"  • нет определения при первом упоминании нового слова или термина — {kinds['nodef']}",
         f"  • определения нет, но слово показано на рисунке (отдельный случай) — {kinds['fig']}",
         f"  • определение дано позже первого упоминания — {kinds['late']}",
         f"  • есть только пояснение (синоним, «т. е.», происхождение слова) — {kinds['explain']}",
-        f"  • термин давно не встречался в прошлых классах ({LONG_GAP_YEARS}+ лет) — {kinds['old']}",
+        f"  • термин без определения, который ученик может не помнить (не встречался, встречался редко "
+        f"или {LONG_GAP_YEARS}+ лет назад) — {kinds['old']}",
         f"  • слово снова встречается после перерыва в {FAR_PAGES}+ страниц — {kinds['far']}",
         f"  • много новых слов на одной странице ({MANY_NEW_ON_PAGE}+) — {kinds['many']}",
         f"  • высокая плотность терминов на странице (10 % самых плотных) — {kinds['dense']}",
@@ -342,6 +389,7 @@ def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path
     pdf = load_pdf(pdf_path)
     recs = build_recommendations(a, R)
     marks = page_marks(a, R)
+    notes = R.get("notes") or term_annotations(a)["by_start"]
     sec_of_page = {}
     for s in R["sections"]:
         for p in range(s["start"], s["end"] + 1):
@@ -356,12 +404,13 @@ def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path
             fp = Path(tmp) / f"cover{i}.jpg"
             img.save(fp, "JPEG", quality=85)
             files.append(fp)
-        for p in sorted(recs):
+        for p in range(1, len(pdf["pages"]) + 1):
             s = sec_of_page.get(p)
             header = f"Страница {p}" + (f" · § {s['num']}. {s['title']}" if s else "")
-            img = render_page(src, pdf, p, marks.get(p, []), recs[p], header)
+            img = render_page(src, pdf, p, marks.get(p, []), recs.get(p, []), header, notes,
+                              a.get("term_sources"))
             fp = Path(tmp) / f"p{p:04d}.jpg"
-            img.save(fp, "JPEG", quality=80)
+            img.save(fp, "JPEG", quality=70)
             files.append(fp)
         for fp in files:
             page = out.new_page(w_pt, h_pt)
@@ -375,5 +424,5 @@ def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path
         out.save(str(out_path))
         out.close()
     src.close()
-    print(f"[PDF-отчёт] {out_path}: страниц с замечаниями {len(recs)}")
+    print(f"[PDF-отчёт] {out_path}: страниц {len(pdf['pages'])}, с замечаниями {len(recs)}")
     return out_path
