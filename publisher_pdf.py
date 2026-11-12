@@ -30,22 +30,27 @@ DPI = 150
 CANVAS = (int(11.69 * DPI), int(8.27 * DPI))      # A4 альбомная
 MARGIN = 28
 FONT_DIR = Path(r"C:\Windows\Fonts")
-YELLOW = (255, 226, 0, 120)
-PINK = (255, 80, 170, 105)
-GREEN = (40, 220, 70, 100)
 
 
-def term_fill(sources: dict | None, key: str):
-    """Фон термина как в Word: ФРП — розовый, указатель — зелёный, словарь — жёлтый."""
-    srcs = (sources or {}).get(key, ())
-    return PINK if "frp" in srcs else GREEN if "index" in srcs else YELLOW
-TURQUOISE = (0, 205, 215, 110)
+def _rgb(hex_color: str) -> tuple[int, int, int]:
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def term_style(sources: dict | None, key: str):
+    """Как в Word: (цвет букв, цвет подчёркивания | None, двойное) — ФРП серый, указатель зелёный, словарь жёлтый."""
+    import term_dictionaries as td
+    color, ucolor, double = td.style_for((sources or {}).get(key, ()) or {"dict"})
+    return _rgb(color), (_rgb(ucolor) if ucolor else None), double
+
+
+TURQUOISE_INK = (0, 163, 184)
+INK_LEVEL = 150          # пиксели темнее этого — буквы, их и перекрашиваем
 RED = (220, 30, 30, 255)
 PURPLE = (120, 60, 170)
 INK = (30, 30, 30)
 GREY = (110, 110, 110)
 PANEL_BG = (247, 247, 244)
-# Страница «плотная», если терминов на 100 слов не меньше, чем на 90 % страниц
+# Страница «плотная», если терминов на 100 токенов не меньше, чем на 90 % страниц
 DENSE_PAGE_QUANTILE = 0.9
 MIN_PAGE_WORDS = 120
 MANY_NEW_ON_PAGE = 4
@@ -197,12 +202,12 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
     R["density_zones"] = (q(0.25), q(0.75), cut)
     for p, d in dens.items():
         if d >= cut:
-            add(p, "dense", "", f"Высокая плотность терминов: {d:.1f} на 100 слов ({page_terms[p]} / "
+            add(p, "dense", "", f"Высокая плотность терминов: {d:.1f} на 100 токенов ({page_terms[p]} / "
                                 f"{R['page_words'][p]} × 100; в среднем по учебнику {mean:.1f}). Разгрузить "
                                 f"текст: пояснить термины, добавить пример или схему.")
     for p, words in page_new.items():
         if len(words) >= MANY_NEW_ON_PAGE:
-            add(p, "many", "", f"На странице {len(words)} новых слов: {', '.join(sorted(words))}. "
+            add(p, "many", "", f"На странице {len(words)} новых слов (разных лемм): {', '.join(sorted(words))}. "
                                f"Проверить, все ли они нужны и объяснены.")
 
     # --- Плотность параграфа — на его первой странице ------------------------------
@@ -210,7 +215,7 @@ def build_recommendations(a, R) -> dict[int, list[dict]]:
     for s in sections:
         if sd.get(s["num"], 0) >= R["density_q3"]:
             add(s["start"], "sec", "", f"§ {s['num']} — один из самых насыщенных терминами параграфов: "
-                                       f"{sd[s['num']]:.1f} на 100 слов основного текста.")
+                                       f"{sd[s['num']]:.1f} на 100 токенов основного текста.")
 
     order = {"nodef": 0, "fig": 1, "late": 2, "explain": 3, "old": 4, "far": 5, "many": 6, "dense": 7, "sec": 8}
     for p in recs:
@@ -267,6 +272,17 @@ def locate(words: list, surface: str, used: set[int]) -> list[int]:
 # Вёрстка
 # =============================================================================
 
+def recolor_ink(img: Image.Image, box: tuple, color: tuple) -> None:
+    """Перекрашивает буквы слова (тёмные пиксели) в color — как цвет шрифта в Word."""
+    box = (max(0, box[0]), max(0, box[1]), min(img.width, box[2]), min(img.height, box[3]))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return
+    region = img.crop(box)
+    mask = region.convert("L").point(lambda v: 255 if v < INK_LEVEL else 0)
+    region.paste(Image.new("RGBA", region.size, color + (255,)), mask=mask)
+    img.paste(region, box[:2])
+
+
 def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, header: str,
                 notes: dict | None = None, sources: dict | None = None,
                 density: dict | None = None) -> Image.Image:
@@ -295,18 +311,30 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
         note = notes.get(start)
         if idx and note:
             # Числа упоминаний в прошлых классах, как в Word: сверху — биология, снизу — все учебники
+            # над термином — учебники биологии, под ним — все учебники (как в Word)
             _, _, sup, sub = (None, *note)
-            _, nx0, ntop, nx1, nbottom = words[idx[-1]]
-            x = nx1 * scale + 2
-            for text, y, color in ((sup, ntop * scale - 9, (30, 123, 52, 255)),
-                                   (sub, nbottom * scale - 6, (31, 78, 154, 255))):
+            _, nx0, ntop, nx1, nbottom = words[idx[0]]
+            x = nx0 * scale
+            for text, y, color in ((sup, ntop * scale - 12, (30, 123, 52, 255)),
+                                   (sub, nbottom * scale - 1, (31, 78, 154, 255))):
+                if not text:
+                    continue
                 w = od.textlength(text, font=note_font)
-                od.rectangle((x - 1, y + 1, x + w + 1, y + 13), fill=(255, 255, 255, 200))
+                od.rectangle((x - 1, y + 1, x + w + 1, y + 13), fill=(255, 255, 255, 170))
                 od.text((x, y - 1), text, font=note_font, fill=color)
+        if kind == "term":
+            ink, ucolor, double = term_style(sources, key)
+        else:
+            ink, ucolor, double = TURQUOISE_INK, None, False
         for j in idx:
             _, x0, top, x1, bottom = words[j]
-            box = (x0 * scale - 1, top * scale - 1, x1 * scale + 1, bottom * scale + 1)
-            od.rectangle(box, fill=term_fill(sources, key) if kind == "term" else TURQUOISE)
+            box = (int(x0 * scale) - 1, int(top * scale) - 1, int(x1 * scale) + 2, int(bottom * scale) + 2)
+            recolor_ink(img, box, ink)
+            if ucolor:
+                uy = bottom * scale + 1
+                od.line((box[0], uy, box[2], uy), fill=ucolor + (255,), width=2)
+                if double:
+                    od.line((box[0], uy + 3, box[2], uy + 3), fill=ucolor + (255,), width=2)
             if key in framed and key not in badge_done:
                 od.rectangle(box, outline=RED, width=3)
         if idx and key in numbered and key not in badge_done:
@@ -357,10 +385,10 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
         y += 12
     if density is not None:
         draw_density(draw, x0, CANVAS[1] - MARGIN - 90 - DENSITY_BLOCK_H + 8, width, density)
-    legend = ("Термины: розовым — ФРП, зелёным — указатель учебника, жёлтым — словарь терминов; бирюзовым — "
-              "новые слова; красная рамка и номер — к слову есть замечание.\n"
-              "Числа у термина — упоминания по классам («5:12» — в 5 классе 12 раз): верхние (зелёные) — "
-              "учебники биологии, нижние (синие) — все учебники прошлых классов.")
+    legend = ("Цвет слова: серый — термин ФРП, зелёный — указатель учебника, жёлтый — словарь терминов; "
+              "бирюзовый — новое слово (лемма); красная рамка и номер — к слову есть замечание.\n"
+              "Числа у термина — упоминания (токены) по классам («5:12» — в 5 классе 12 раз): над термином "
+              "(зелёные) — учебники биологии, под ним (синие) — все учебники прошлых классов.")
     gl = wrap(draw, legend, font(14), width)
     for i, ln in enumerate(gl):
         draw.text((x0, CANVAS[1] - MARGIN - 12 - (len(gl) - i) * 18), ln, font=font(14), fill=GREY)
@@ -388,7 +416,7 @@ def draw_density(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, d: dict)
     draw.line((x, y - 6, x + width, y - 6), fill=(205, 205, 200), width=1)
     title_f, f, small = font(19, True), font(17), font(13)
     draw.text((x, y), "Терминологическая плотность", font=title_f, fill=INK)
-    formula = "= терминов / слов × 100"
+    formula = "= терминов / токенов × 100"
     draw.text((x + draw.textlength("Терминологическая плотность ", font=title_f), y + 3), formula,
               font=font(14), fill=GREY)
     y += 28
@@ -405,10 +433,10 @@ def draw_density(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, d: dict)
         draw.rounded_rectangle((x, y, x + 132, y + 26), radius=6, fill=color)
         draw.text((x + 66 - draw.textlength(name, font=font(16, True)) / 2, y + 4), name,
                   font=font(16, True), fill="white")
-        txt = (f"{value:.1f} терминов на 100 слов: {d['terms']} / {d['words']} × 100; "
+        txt = (f"{value:.1f} терминов на 100 токенов: {d['terms']} / {d['words']} × 100; "
                f"выше, чем на {share:.0%} страниц учебника")
         if d.get("approx"):
-            txt += f". Основного текста мало (меньше {MIN_PAGE_WORDS} слов) — оценка приблизительная"
+            txt += f". Основного текста мало (меньше {MIN_PAGE_WORDS} токенов) — оценка приблизительная"
         lines = wrap(draw, txt, f, width - 145)
         for i, ln in enumerate(lines):
             draw.text((x + 145, y + 3 + i * 21), ln, font=f, fill=INK)
@@ -435,8 +463,8 @@ def draw_density(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, d: dict)
         lab = f"{v:.0f}"
         px = hx + (v / top if top else 0) * hw
         draw.text((px - draw.textlength(lab, font=small) / 2, hy + hh + 3), lab, font=small, fill=GREY)
-    draw.text((hx + hw - draw.textlength("терминов на 100 слов", font=small), hy + hh + 17),
-              "терминов на 100 слов", font=small, fill=GREY)
+    draw.text((hx + hw - draw.textlength("терминов на 100 токенов", font=small), hy + hh + 17),
+              "терминов на 100 токенов", font=small, fill=GREY)
     draw.text((hx, hy + hh + 17), "число страниц учебника", font=small, fill=GREY)
     if value is not None:
         px = hx + min(1.0, value / top if top else 0) * hw
@@ -467,15 +495,17 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         for r in lst:
             kinds[r["kind"]] += 1
     lines = [
-        "Слева — страница учебника. Термины: розовым — из ФРП (рабочей программы), зелёным — из указателя "
-        "терминов учебника, жёлтым — из общего словаря терминов; бирюзовым — новые для ученика слова "
-        f"(в прошлых классах встречались меньше {a.min_freq} раз). Красной рамкой и номером отмечены слова, "
+        "Слева — страница учебника. Выделение — цветом слова: серый — термины ФРП (рабочей программы), "
+        "зелёный — указатель терминов учебника, жёлтый — общий словарь терминов (термин из нескольких "
+        "словарей: цвет — по старшему, подчёркивание — цветом второго словаря, двойное — во всех трёх); "
+        f"бирюзовый — новые для ученика слова: лемма (начальная форма слова) в прошлых классах встречалась "
+        f"меньше {a.min_freq} раз (токенов любой формы). Красной рамкой и номером отмечены слова, "
         "к которым относится замечание справа.",
         "",
         f"В черновике все {n_pages_total} страниц учебника; замечания есть на {len(recs)} из них.",
         "Числа у термина (при первом упоминании и после перерыва в 20 и больше страниц) — упоминания в прошлых "
-        "классах по классам, «5:12» — в 5 классе 12 раз: верхняя строка, зелёная — учебники биологии, нижняя, "
-        "синяя — все школьные учебники. Классы без упоминаний не показаны, «0» — ни разу, «т» — тысяч.",
+        "классах по классам (токенов), «5:12» — в 5 классе 12 раз: над термином, зелёные — учебники биологии, "
+        "под ним, синие — все школьные учебники. Классы без упоминаний не показаны, «0» — ни разу, «т» — тысяч.",
         "",
         "Виды замечаний:",
         f"  • нет определения при первом упоминании нового слова или термина — {kinds['nodef']}",
@@ -486,7 +516,7 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         f"  • термин без определения, который ученик может не помнить (не встречался, встречался редко "
         f"или {LONG_GAP_YEARS}+ лет назад) — {kinds['old']}",
         f"  • слово снова встречается после перерыва в {FAR_PAGES}+ страниц — {kinds['far']}",
-        f"  • много новых слов на одной странице ({MANY_NEW_ON_PAGE}+) — {kinds['many']}",
+        f"  • много новых слов (разных лемм) на одной странице ({MANY_NEW_ON_PAGE}+) — {kinds['many']}",
         f"  • высокая плотность терминов на странице (10 % самых плотных) — {kinds['dense']}",
         f"  • параграф с высокой плотностью терминов (25 % самых плотных) — {kinds['sec']}",
         "",
@@ -494,10 +524,12 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
         "страницам учебника с отметкой этой страницы.",
         "Формула: плотность = Т / С × 100, где Т — число выделенных терминов на странице (из всех словарей; "
         "составной термин — одно вхождение, слово внутри более длинного термина отдельно не считается), "
-        "С — число слов на странице. Учитывается только основной текст параграфа: от начала параграфа до "
+        "С — число токенов (словоупотреблений: каждое слово текста считается столько раз, сколько встретилось) "
+        "на странице. Учитывается только основной текст параграфа: от начала параграфа до "
         "рубрики «Тренируемся»; вопросы, «Это интересно», «Шаги к успеху», введение и приложения не входят. "
-        "Пример (с. 78): 81 термин на 234 словах — 81 / 234 × 100 = 34,6 термина на 100 слов. Если на странице "
-        f"меньше {MIN_PAGE_WORDS} слов основного текста, значение приблизительное и в распределение не входит.",
+        "Пример (с. 78): 81 термин на 234 токенах — 81 / 234 × 100 = 34,6 термина на 100 токенов. Если на "
+        f"странице меньше {MIN_PAGE_WORDS} токенов основного текста, значение приблизительное и в распределение "
+        "не входит.",
         "Цвет — зона по распределению страниц: синяя — низкая (четверть самых разреженных страниц), "
         "зелёная — средняя, оранжевая — повышенная (от 75 до 90 %), красная — высокая (10 % самых плотных).",
         "",

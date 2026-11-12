@@ -6,9 +6,9 @@
   frp   — термины из федеральной рабочей программы (что требуется от ученика).
 
 Термин может входить в несколько словарей; для каждого паттерна (леммы
-через пробел) хранится набор словарей. Подсветка: фон — по старшему
+через пробел) хранится набор словарей. Выделение: цвет слова — по старшему
 словарю (ФРП > указатель > общий словарь), подчёркивание — второй словарь
-(цветом этого словаря) или двойное, если термин во всех трёх.
+(цветом этого словаря), двойное — если термин во всех трёх.
 """
 from __future__ import annotations
 
@@ -18,16 +18,18 @@ from pathlib import Path
 
 import pandas as pd
 from docx import Document
-from docx.enum.text import WD_COLOR_INDEX
 
 import config
 from src.analyzer import normalize_term_to_pattern
 
 SOURCES = ("frp", "index", "dict")          # по старшинству
 SOURCE_NAMES = {"frp": "ФРП", "index": "указатель учебника", "dict": "словарь терминов"}
-HIGHLIGHT = {"frp": WD_COLOR_INDEX.PINK, "index": WD_COLOR_INDEX.BRIGHT_GREEN, "dict": WD_COLOR_INDEX.YELLOW}
-UNDERLINE_COLOR = {"frp": "D6007E", "index": "00A651", "dict": "B8860B"}
-ALL_THREE_COLOR = "404040"
+# Термин выделяется цветом шрифта (не заливкой): серый, зелёный, жёлтый
+# (тёмно-жёлтый — светлый жёлтый на белом не читается)
+FONT_COLOR = {"frp": "7F7F7F", "index": "00A04A", "dict": "C49A00"}
+COLOR_NAMES = {"frp": "серый", "index": "зелёный", "dict": "жёлтый"}
+UNDERLINE_COLOR = FONT_COLOR
+NEW_WORD_COLOR = "00A3B8"        # новые слова — бирюзовый
 
 PAGES_RE = re.compile(r"[\s,]*\d{1,3}(?:\s*[,–-]\s*\d{1,3})*\s*$")
 LETTER_RE = re.compile(r"^[A-ZА-ЯЁ]$")
@@ -37,16 +39,15 @@ SEARCH_ONLY: set[str] = set()
 
 
 def style_for(sources) -> tuple:
-    """(цвет фона, цвет подчёркивания | None, двойное подчёркивание)."""
+    """(цвет шрифта, цвет подчёркивания | None, двойное подчёркивание)."""
     present = [s for s in SOURCES if s in sources]
     if not present:
-        return (HIGHLIGHT["dict"], None, False)
-    bg = HIGHLIGHT[present[0]]
+        return (FONT_COLOR["dict"], None, False)
+    color = FONT_COLOR[present[0]]
     if len(present) == 1:
-        return (bg, None, False)
-    if len(present) == 2:
-        return (bg, UNDERLINE_COLOR[present[1]], False)
-    return (bg, ALL_THREE_COLOR, True)
+        return (color, None, False)
+    # Подчёркивание — цветом второго словаря; во всех трёх — двойное
+    return (color, UNDERLINE_COLOR[present[1]], len(present) == 3)
 
 
 def _with_aliases(text: str) -> list[str]:
