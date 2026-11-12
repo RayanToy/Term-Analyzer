@@ -23,6 +23,8 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont
 
+import re
+
 import config
 from textbook_report import EVERYDAY_PRIMARY, EVERYDAY_TOTAL, FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc, term_annotations
 
@@ -305,6 +307,7 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
     badge_done = set()
     notes = notes or {}
     note_font = font(12, True)
+    note_boxes: list[tuple[float, float, float, float]] = []   # уже нарисованные ряды чисел
     for start, kind, key, surface in marks:
         idx = locate(words, surface, used)
         used.update(idx)
@@ -320,8 +323,18 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
                 if not text:
                     continue
                 w = od.textlength(text, font=note_font)
-                od.rectangle((x - 1, y + 1, x + w + 1, y + 13), fill=(255, 255, 255, 170))
-                od.text((x, y - 1), text, font=note_font, fill=color)
+                # Соседние термины: ряд сдвигается вправо, пока не перестанет наезжать на другой
+                tx = x
+                for _ in range(40):
+                    hit = [b for b in note_boxes if b[0] < tx + w + 3 and tx < b[1] + 3 and b[2] < y + 13 and y + 1 < b[3]]
+                    if not hit:
+                        break
+                    tx = max(b[1] for b in hit) + 3
+                if tx + w > img.width - 2:
+                    tx = max(0, img.width - 2 - w)
+                note_boxes.append((tx, tx + w, y + 1, y + 13))
+                od.rectangle((tx - 1, y + 1, tx + w + 1, y + 13), fill=(255, 255, 255, 170))
+                od.text((tx, y - 1), text, font=note_font, fill=color)
         if kind == "term":
             ink, ucolor, double = term_style(sources, key)
         else:
@@ -593,4 +606,151 @@ def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path
         out.close()
     src.close()
     print(f"[PDF-отчёт] {out_path}: страниц {len(pdf['pages'])}, с замечаниями {len(recs)}")
+    return out_path
+
+
+# =============================================================================
+# «Числа у терминов»: страница учебника + все её термины с числами упоминаний
+# =============================================================================
+
+NUM_GREEN = (30, 123, 52)
+NUM_BLUE = (31, 78, 154)
+
+
+def _entry_lines(draw, segs, fonts, width):
+    """Разбивка записи [(текст, цвет, жирный)] на строки по ширине; строка — список кусков."""
+    lines, line, used = [], [], 0.0
+    for text, color, bold in segs:
+        f = fonts[bold]
+        for tok in text.split(" "):
+            if not tok:
+                continue
+            w = draw.textlength(tok + " ", font=f)
+            if line and used + w > width:
+                lines.append(line)
+                line, used = [], 0.0
+            line.append((tok + " ", color, f))
+            used += w
+    if line:
+        lines.append(line)
+    return lines
+
+
+def render_numbers_page(src, pdf: dict, page_no: int, marks, entries: list, header: str,
+                        sources: dict | None, legend: str) -> Image.Image:
+    """Слева страница с выделенными терминами, справа — список терминов страницы с числами."""
+    canvas = render_page(src, pdf, page_no, marks, [], header, {}, sources, None)
+    draw = ImageDraw.Draw(canvas)
+    pinfo = pdf["pages"][page_no - 1]
+    img_w = int(pinfo["w"] * (CANVAS[1] - 2 * MARGIN) / pinfo["h"])
+    x0 = MARGIN * 2 + img_w
+    width = CANVAS[0] - x0 - MARGIN
+    draw.rectangle((x0 - 10, MARGIN, CANVAS[0] - MARGIN + 10, CANVAS[1] - MARGIN), fill=PANEL_BG)
+    y = MARGIN + 14
+    y += draw_textblock(draw, x0, y, header, font(23, True), width) + 6
+    leg = wrap(draw, legend, font(14), width)
+    bottom = CANVAS[1] - MARGIN - 12 - len(leg) * 18
+    for i, ln in enumerate(leg):
+        draw.text((x0, bottom + 6 + i * 18), ln, font=font(14), fill=GREY)
+    if not entries:
+        draw.text((x0, y + 6), "Терминов на странице нет.", font=font(21), fill=GREY)
+        return canvas
+    top = y + 6
+    avail = bottom - top - 6
+    layout = None
+    for size in (19, 17, 15, 14, 13, 12, 11, 10, 9):
+        for ncols in (1, 2, 3):
+            fonts = {True: font(size, True), False: font(size)}
+            col_w = (width - (ncols - 1) * 18) / ncols
+            lh = size + 4
+            blocks = []
+            for key, sup, sub in entries:
+                segs = [(key + ":", INK, True), ("био " + sup, NUM_GREEN, False), ("· все " + sub, NUM_BLUE, False)]
+                blocks.append(_entry_lines(draw, segs, fonts, col_w))
+            # раскладка по колонкам без разрыва записи
+            cols, cur, h = [[]], 0, 0
+            for b in blocks:
+                bh = len(b) * lh + 5
+                if h + bh > avail and cols[cur]:
+                    cols.append([])
+                    cur += 1
+                    h = 0
+                cols[cur].append(b)
+                h += bh
+            if len(cols) <= ncols:
+                layout = (cols, col_w, lh)
+                break
+        if layout:
+            break
+    if layout is None:
+        layout = (cols[:ncols], col_w, lh)      # самый мелкий шрифт: что не вошло — отмечаем
+        draw.text((x0, bottom - 16), "… не все термины поместились", font=font(13, True), fill=RED[:3])
+    cols, col_w, lh = layout
+    for ci, col in enumerate(cols):
+        cx, cy = x0 + ci * (col_w + 18), top
+        for b in col:
+            for line in b:
+                lx = cx
+                for text, color, f in line:
+                    draw.text((lx, cy), text, font=f, fill=color)
+                    lx += draw.textlength(text, font=f)
+                cy += lh
+            cy += 5
+    return canvas
+
+
+def write_numbers_pdf(a, R, out_path: Path, pdf_path: Path | None = None) -> Path:
+    """
+    PDF «Числа у терминов»: на каждой странице учебника — все её термины
+    (каждый один раз, в порядке появления) и сколько раз термин встречался
+    в прошлых классах по классам. Учебник не перевёрстывается: слева
+    страница издательского PDF, числа — справа обычным шрифтом.
+    """
+    from textbook_report import grades_note
+    pdf_path = Path(pdf_path or config.SOURCE_PDF[a.grade])
+    pdf = load_pdf(pdf_path)
+    marks = page_marks(a, R)
+    prior = R["prior"]
+    bio_span = f"{prior.bio_grades[0]}–{prior.bio_grades[-1]}" if prior.bio_grades else "—"
+    legend = (f"«5:12» — в 5 классе 12 раз (токенов). био (зелёные) — учебники биологии {bio_span} классов; "
+              f"все (синие) — все школьные учебники 2–{a.grade - 1} классов. Классы без упоминаний не показаны; "
+              f"«0» — ни разу; «т» — тысяч. Цвет слова на странице: серый — ФРП, зелёный — указатель, "
+              f"жёлтый — словарь терминов, бирюзовый — новое слово.")
+    sec_of_page = {}
+    for s in R["sections"]:
+        for p in range(s["start"], s["end"] + 1):
+            sec_of_page[p] = s
+    src = pdfium.PdfDocument(str(pdf_path))
+    out = pdfium.PdfDocument.new()
+    w_pt, h_pt = 842, 595
+    total = 0
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        for p in range(1, len(pdf["pages"]) + 1):
+            entries, seen = [], set()
+            for _, kind, key, surf in marks.get(p, []):
+                if kind == "term" and key not in seen:
+                    seen.add(key)
+                    m = R["term_prior"][key]
+                    # термин — как он написан на странице (без переноса строки)
+                    shown = re.sub(r"\s+", " ", re.sub(r"[-­]\s+", "", surf)).strip().lower() or key
+                    entries.append((shown, grades_note(m["bio"]), grades_note(m["all"])))
+            total += len(entries)
+            s = sec_of_page.get(p)
+            header = f"Страница {p}" + (f" · § {s['num']}. {s['title']}" if s else "") + \
+                     f" — термины и их упоминания в прошлых классах ({len(entries)})"
+            img = render_numbers_page(src, pdf, p, marks.get(p, []), entries, header, a.get("term_sources"), legend)
+            fp = Path(tmp) / f"p{p:04d}.jpg"
+            img.save(fp, "JPEG", quality=72)
+            page = out.new_page(w_pt, h_pt)
+            image = pdfium.PdfImage.new(out)
+            image.load_jpeg(str(fp), inline=False)
+            image.set_matrix(pdfium.PdfMatrix().scale(w_pt, h_pt))
+            page.insert_obj(image)
+            page.gen_content()
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out.save(str(out_path))
+        out.close()
+    src.close()
+    print(f"[Числа у терминов] {out_path}: страниц {len(pdf['pages'])}, записей {total}")
     return out_path

@@ -1013,7 +1013,7 @@ def grades_note(c: Counter) -> str:
     return " ".join(parts) if parts else "0"
 
 
-def term_annotations(a, use_cache: bool = True) -> dict:
+def term_annotations(a, use_cache: bool = True, every: bool = False) -> dict:
     """
     Где в тексте поставить у термина числа упоминаний в прошлых классах
     по классам: сверху — учебники биологии («5:12 7:3»), снизу — все учебники.
@@ -1024,8 +1024,12 @@ def term_annotations(a, use_cache: bool = True) -> dict:
     внутри более длинного термина («мембрана» в «клеточная мембрана»)
     отдельной пометки не получает.
 
+    every=True — пометка у каждого вхождения термина (для примечаний Word);
+    "by_start" (числа на страницах рекомендаций издателю) всегда только
+    первое упоминание и после перерыва.
+
     Returns:
-        {"by_para": {абзац: [(позиция после первой буквы термина, верхнее, нижнее)]},
+        {"by_para": {абзац: [(позиция после первой буквы термина, верхнее, нижнее, конец термина)]},
          "by_start": {начало вхождения в потоке: (ключ, верхнее, нижнее)},
          "bio_span", "all_span", "corpus", "prior", "pm"}
     """
@@ -1059,6 +1063,7 @@ def term_annotations(a, use_cache: bool = True) -> dict:
     grade_counts = corpus.counts(multi) if multi else {}
     prior = PriorMentions(a.grade, a.preprocessor, a.patterns_by_len, a.verb_shadowed, use_cache)
     by_para, by_start = defaultdict(list), {}
+    seen_on_page = set()
     for key, lst in occ.items():
         m = prior.of(key, True, corpus_grades=grade_counts.get(key, {}).get("grade"))
         sup, sub = grades_note(m["bio"]), grades_note(m["all"])
@@ -1068,13 +1073,19 @@ def term_annotations(a, use_cache: bool = True) -> dict:
             # Приложения и указатель терминов после последнего параграфа не размечаются
             if inside_longer(s, e) or (page and page > last_section_page):
                 continue
-            if last_page is None or (page and page - last_page >= FAR_PAGES):
-                # Надпись с числами привязывается к первой букве термина
-                rng = a.stream.to_paragraphs(s, s + 1)
+            first = last_page is None or (page and page - last_page >= FAR_PAGES)
+            # every: одно примечание на термин на каждой странице — повторы на той же
+            # странице не дублируются, иначе примечания не помещаются на полосе
+            new_on_page = (page, key) not in seen_on_page
+            seen_on_page.add((page, key))
+            if (every and (new_on_page or page is None)) or first:
+                # Пометка привязывается к первой букве термина; конец — в том же абзаце
+                rng = a.stream.to_paragraphs(s, e)
                 if rng and not in_box(rng[0][0]):
-                    pi, ps, _ = rng[0]
-                    by_para[pi].append((ps + 1, sup, sub))
-                    by_start[s] = (key, sup, sub)
+                    pi, ps, pe = rng[0]
+                    by_para[pi].append((ps + 1, sup, sub, pe))
+                    if first:
+                        by_start[s] = (key, sup, sub)
             if page:
                 last_page = page
     bio_grades = prior.bio_grades
@@ -1667,6 +1678,7 @@ def main() -> None:
     if args.pdf:
         import publisher_pdf
         publisher_pdf.write_pdf_report(a, R, report_path(a, f"рекомендации_издателю_порог{a.min_freq}.pdf"))
+        publisher_pdf.write_numbers_pdf(a, R, report_path(a, f"числа_у_терминов_порог{a.min_freq}.pdf"))
 
 
 if __name__ == "__main__":

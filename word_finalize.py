@@ -2,8 +2,9 @@
 Финальный шаг: PDF размеченных учебников через Word.
 
 Числа упоминаний у терминов стоят в плавающих надписях, которые не
-занимают места в строке, поэтому полей и их ошибок больше нет — документ
-просто экспортируется в PDF. После экспорта проверяется, что в PDF нет
+занимают места в строке. Сначала note_layout по координатам из Word
+раздвигает надписи соседних терминов, чтобы числа не наезжали друг на
+друга, затем документ экспортируется в PDF. После экспорта проверяется, что в PDF нет
 «Ошибка!» (на случай полей, оставшихся в исходнике).
 
 Word запускается отдельным процессом через PowerShell (COM); открытые
@@ -66,6 +67,11 @@ def export_pdf(paths: list[Path]) -> None:
 def main(paths: list[str]) -> None:
     # «~$…docx» — служебные файлы блокировки открытых в Word документов
     docs = [Path(p).resolve() for p in paths if not Path(p).name.startswith("~$")]
+    import tempfile
+    import note_layout
+    with tempfile.TemporaryDirectory() as tmp:
+        for d in docs:
+            note_layout.layout(d, Path(tmp))
     export_pdf(docs)
     for d in docs:
         pdf = d.with_suffix(".pdf")

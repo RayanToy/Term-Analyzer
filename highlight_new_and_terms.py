@@ -1262,7 +1262,39 @@ NOTE_ALL_COLOR = '1F4E9A'   # нижнее число — все учебник�
 NOTE_FONT_PT = 5            # размер чисел у термина
 
 
-def add_annotations(paragraph: Paragraph, notes: list[tuple[int, str, str]]) -> int:
+# Как показывать числа: 'comments' — примечания Word у каждого термина (читаются
+# обычным шрифтом на полосе справа, текст страницы не меняется);
+# 'boxes' — мелкие плавающие надписи над и под термином
+NOTE_MODE = 'comments'
+NOTE_AUTHOR = 'Упоминания в прошлых классах'
+
+
+def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int]]) -> int:
+    """
+    Примечание Word на каждом термине: «Биология: 5:12 7:3 · Все учебники: 2:51 …».
+    Раскраска уже разрезала runs по границам терминов, поэтому термин — целые runs.
+    """
+    document = paragraph.part.document
+    bounds, pos = [], 0
+    for run in paragraph.runs:
+        bounds.append((pos, pos + len(run.text), run))
+        pos += len(run.text)
+    done = 0
+    for off, sup, sub, end in notes:
+        start = off - 1
+        runs = [r for a, b, r in bounds if a < b and a >= start and b <= end]
+        if not runs:
+            # граница термина внутри run (термин не раскрашен) — берём run с первой буквой
+            runs = [r for a, b, r in bounds if a <= start < b][:1]
+        if not runs:
+            continue
+        document.add_comment(runs=[runs[0], runs[-1]], text=f"био {sup} | все {sub}",
+                             author=NOTE_AUTHOR, initials="")
+        done += 1
+    return done
+
+
+def add_annotations(paragraph: Paragraph, notes: list[tuple[int, str, str, int]]) -> int:
     """
     Ставит у термина два ряда маленьких чисел: над термином (сколько раз
     он встречался в учебниках биологии прошлых классов) и под ним (во всех
@@ -1283,8 +1315,10 @@ def add_annotations(paragraph: Paragraph, notes: list[tuple[int, str, str]]) -> 
     Returns:
         Сколько пометок поставлено
     """
+    if NOTE_MODE == 'comments':
+        return add_note_comments(paragraph, notes)
     done = 0
-    for off, sup, sub in sorted(notes, reverse=True):
+    for off, sup, sub, _ in sorted(notes, reverse=True):
         pos = 0
         for run in list(paragraph.runs):
             r_start, r_end = pos, pos + len(run.text)
@@ -1320,18 +1354,24 @@ NOTE_UP_PT = -4.5
 NOTE_DOWN_PT = 11.5
 
 
-def _note_box(text: str, color: str, top_pt: float):
+_NOTE_IDS = iter(range(1, 10 ** 9))
+
+
+def _note_box(text: str, color: str, top_pt: float, alt: str):
     """
     Run с плавающей надписью (VML) без обтекания: положение — от символа
     привязки и от верха его строки, в строке места не занимает.
+    alt («tn:<номер>:<t|b>») — метка для note_layout, который раздвигает
+    наезжающие надписи по координатам из Word.
     """
+    from note_layout import text_width
     size = NOTE_FONT_PT
-    width = len(text) * size * 0.56 + 2
+    width = text_width(text, size) + 2
     height = size * 1.25
     text = text.replace('&', '&amp;').replace('<', '&lt;')
     return parse_xml(
         f'<w:r {_VML_NS}><w:rPr><w:noProof/></w:rPr><w:pict>'
-        f'<v:rect style="position:absolute;margin-left:{NOTE_LEFT_PT}pt;margin-top:{top_pt}pt;'
+        f'<v:rect alt="{alt}" style="position:absolute;margin-left:{NOTE_LEFT_PT}pt;margin-top:{top_pt}pt;'
         f'width:{width:.1f}pt;height:{height:.1f}pt;z-index:251660000;'
         f'mso-position-horizontal-relative:char;mso-position-vertical-relative:line;mso-wrap-style:none" '
         f'filled="f" stroked="f"><v:textbox inset="0,0,0,0"><w:txbxContent><w:p><w:pPr>'
@@ -1346,10 +1386,11 @@ def _note_box(text: str, color: str, top_pt: float):
 def _note_boxes(sup: str, sub: str) -> list:
     """Две надписи: над термином — учебники биологии, под ним — все учебники."""
     out = []
+    nid = next(_NOTE_IDS)
     if sup:
-        out.append(_note_box(sup, NOTE_BIO_COLOR, NOTE_UP_PT))
+        out.append(_note_box(sup, NOTE_BIO_COLOR, NOTE_UP_PT, f"tn:{nid}:t"))
     if sub:
-        out.append(_note_box(sub, NOTE_ALL_COLOR, NOTE_DOWN_PT))
+        out.append(_note_box(sub, NOTE_ALL_COLOR, NOTE_DOWN_PT, f"tn:{nid}:b"))
     return out
 
 
@@ -1625,7 +1666,7 @@ def highlight_textbook(
         },
     )
     # Пометки у терминов: сколько раз термин встречался в прошлых классах
-    notes = textbook_report.term_annotations(a)
+    notes = textbook_report.term_annotations(a, every=NOTE_MODE == 'comments')
 
     painted = 0
     for pi, spans in colored_by_para.items():
@@ -1841,7 +1882,24 @@ def write_legend(out_path: str | Path, grade: int, base_descr: str, min_freq: in
               "лемме (начальной форме слова): все формы слова считаются вместе, а «раз» — это "
               "вхождения (токены) любой формы.")
 
-    if bio_span:
+    if bio_span and NOTE_MODE == 'comments':
+        p = doc.add_paragraph()
+        p.add_run("Числа у термина ").bold = True
+        p.add_run("— сколько раз термин встречался в прошлых классах (вхождений, токенов), по классам: "
+                  "«5:12» значит «в 5 классе 12 раз». ")
+        colored(p, "био", NOTE_BIO_COLOR)
+        p.add_run(f" — учебники биологии {bio_span} классов, ")
+        colored(p, "все", NOTE_ALL_COLOR)
+        p.add_run(f" — все школьные учебники {all_span} классов. Классы, где термина не было, не показаны; "
+                  f"«0» — не встречался ни разу; «т» — тысяч.")
+        p = doc.add_paragraph()
+        p.add_run("Где смотреть числа. ").bold = True
+        p.add_run("В учебнике Word числа стоят в примечаниях: у каждого термина при первом его появлении на "
+                  "каждой странице (вкладка «Рецензирование» → «Показать примечания» или область примечаний). "
+                  "Примечания не занимают места в тексте, поэтому страницы совпадают с исходным учебником. "
+                  "Для чтения и печати есть отдельный файл «…числа_у_терминов….pdf»: слева страница учебника, "
+                  "справа — все термины этой страницы с числами.")
+    elif bio_span:
         p = doc.add_paragraph()
         p.add_run("Числа у термина ").bold = True
         p.add_run(f"(при первом упоминании и там, где он снова появляется после перерыва в 20 и больше "
