@@ -1,7 +1,7 @@
 """
-Одно примечание с числами на термин на каждой странице Word; примечания
-страницы собраны не больше чем в MAX_BALLOONS выносок (подряд идущие термины,
-по строке на термин), иначе Word не умещает выноски и сворачивает их.
+Одно примечание с числами на термин на каждой странице Word (у каждого
+термина своё; на плотных страницах Word сворачивает часть выносок — они
+раскрываются щелчком).
 
 Примечания ставятся у каждого вхождения термина, а на какой странице
 окажется вхождение, знает только Word. Поэтому Word сообщает страницу
@@ -13,13 +13,10 @@
 from __future__ import annotations
 
 import bisect
-import copy
-import math
 import re
 import subprocess
 from pathlib import Path
 
-MAX_BALLOONS = 8      # выносок на странице: больше Word не умещает и сворачивает их
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 PS_DUMP = r"""
@@ -100,48 +97,11 @@ def dedupe(docx: Path, work_dir: Path) -> None:
               f"({len(rows)} и {len(order)}) — повторы не убраны")
         return
     seen, drop = set(), set()
-    para_of = {}
-    for ref in doc.element.body.iter(W + "commentReference"):
-        p = ref
-        while p is not None and p.tag != W + "p":
-            p = p.getparent()
-        para_of[ref.get(W + "id")] = p
-    groups: dict = {}
     for cid, (page, _) in zip(order, rows):
         key = (page, text_of[cid].split(":", 1)[0])
         if key in seen:
             drop.add(cid)
-        else:
-            groups.setdefault(page, []).append(cid)
         seen.add(key)
-    # Выноски одного абзаца на одной странице — в одну (по строке на термин): иначе на
-    # плотной странице их десятки, Word не умещает их по высоте и сворачивает в одну строку
-    merged = 0
-    chunks = []
-    for ids in groups.values():
-        # на странице не больше MAX_BALLOONS выносок: подряд идущие термины в одну,
-        # разрыв — на границе абзаца, если выноска уже набрала свою долю терминов
-        target = max(1, math.ceil(len(ids) / MAX_BALLOONS))
-        cur = []
-        for cid in ids:
-            if cur and (len(cur) >= 2 * target
-                        or (len(cur) >= target and para_of[cid] is not para_of[cur[-1]])):
-                chunks.append(cur)
-                cur = []
-            cur.append(cid)
-        if cur:
-            chunks.append(cur)
-    for ids in chunks:
-        keep = by_id[ids[0]]
-        for cid in ids[1:]:
-            for cp in by_id[cid].findall(W + "p"):
-                np_ = copy.deepcopy(cp)
-                for r in list(np_.iter(W + "r")):
-                    if r.find(W + "annotationRef") is not None:
-                        r.getparent().remove(r)
-                keep.append(np_)
-            drop.add(cid)
-            merged += 1
     for tag in ("commentRangeStart", "commentRangeEnd"):
         for el in list(doc.element.body.iter(W + tag)):
             if el.get(W + "id") in drop:
@@ -153,5 +113,5 @@ def dedupe(docx: Path, work_dir: Path) -> None:
     for cid in drop:
         comments_el.remove(by_id[cid])
     doc.save(str(docx))
-    print(f"[Примечания] {docx.name}: было {len(order)}, повторов на странице убрано {len(drop) - merged}, "
-          f"объединено в выноски {merged}, выносок осталось {len(order) - len(drop)}")
+    print(f"[Примечания] {docx.name}: было {len(order)}, повторов на странице убрано {len(drop)}, "
+          f"осталось {len(order) - len(drop)}")

@@ -1291,7 +1291,8 @@ def comment_style(doc) -> None:
 
 def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int]]) -> int:
     """
-    Примечание Word на каждом термине: «Биология: 5:12 7:3 · Все учебники: 2:51 …».
+    Примечание Word на каждом термине, три строки: «термин:» (чёрным, жирным),
+    «био 5:12 7:3» (зелёным), «все 2:51 …» (синим).
     Раскраска уже разрезала runs по границам терминов, поэтому термин — целые runs.
     """
     document = paragraph.part.document
@@ -1308,8 +1309,13 @@ def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int
             runs = [r for a, b, r in bounds if a <= start < b][:1]
         if not runs:
             continue
-        document.add_comment(runs=[runs[0], runs[-1]], text=f"{key}: био {sup} | все {sub}",
-                             author=NOTE_AUTHOR, initials="")
+        c = document.add_comment(runs=[runs[0], runs[-1]], text=f"{key}:", author=NOTE_AUTHOR, initials="")
+        head = c.paragraphs[0].runs[-1]
+        head.bold = True
+        head.font.color.rgb = RGBColor.from_string("000000")
+        for label, nums, color in (("био", sup, NOTE_BIO_COLOR), ("все", sub, NOTE_ALL_COLOR)):
+            r = c.add_paragraph().add_run(f"{label} {nums}")
+            r.font.color.rgb = RGBColor.from_string(color)
         done += 1
     return done
 
@@ -1957,8 +1963,8 @@ def write_legend(out_path: str | Path, grade: int, base_descr: str, min_freq: in
         p = doc.add_paragraph()
         p.add_run("Где смотреть числа. ").bold = True
         p.add_run("В учебнике Word числа стоят в примечаниях: у каждого термина при первом его появлении на "
-                  "каждой странице (повторы на той же странице без примечаний); соседние термины собраны в одну "
-                  "выноску, по строке на термин (вкладка «Рецензирование» → «Показать примечания» или область примечаний). "
+                  "каждой странице (повторы на той же странице без примечаний); в примечании три строки: термин, "
+                  "«био …» (зелёным) и «все …» (синим) (вкладка «Рецензирование» → «Показать примечания» или область примечаний). "
                   "Примечания не занимают места в тексте, поэтому страницы совпадают с исходным учебником. "
                   "Для чтения и печати есть отдельный файл «…числа_у_терминов….pdf»: слева страница учебника, "
                   "справа — все термины этой страницы с числами.")
