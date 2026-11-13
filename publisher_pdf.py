@@ -15,6 +15,7 @@ PDF-черновик для издателя: слева страница уче
 """
 from __future__ import annotations
 
+import json
 import statistics
 import tempfile
 from collections import defaultdict
@@ -26,6 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 import re
 
 import config
+import textbook_report
 from textbook_report import EVERYDAY_PRIMARY, EVERYDAY_TOTAL, FAR_PAGES, FIG_STATUS, LONG_GAP_YEARS, compact, load_pdf, parse_toc, term_annotations
 
 DPI = 150
@@ -274,6 +276,66 @@ def locate(words: list, surface: str, used: set[int]) -> list[int]:
 # Вёрстка
 # =============================================================================
 
+def _pdf_rgb(col) -> tuple | None:
+    """Цвет символа PDF в RGB (серый одной компонентой — чёрная краска)."""
+    if not isinstance(col, (list, tuple)):
+        return None
+    if len(col) == 4:
+        c, m, y, k = col
+        return tuple(int(255 * (1 - v) * (1 - k)) for v in (c, m, y))
+    if len(col) == 3:
+        return tuple(int(255 * v) for v in col)
+    return None
+
+
+def publisher_colors(pdf_path: Path) -> dict:
+    """Рамки цветных (не чёрных и не белых) слов издателя на каждой странице PDF
+    и цвет обычного текста учебника: {"boxes": [...], "ink": [r, g, b]}."""
+    pdf_path = Path(pdf_path)
+    cache = textbook_report.CACHE_DIR / f"pdfcolors2_{pdf_path.stem}.json"
+    if cache.exists() and cache.stat().st_mtime >= pdf_path.stat().st_mtime:
+        return json.loads(cache.read_text(encoding="utf-8"))
+    import pdfplumber
+    pages = []
+    from collections import Counter
+    dark = Counter()
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            boxes = []
+            for ch in page.chars:
+                rgb = _pdf_rgb(ch.get("non_stroking_color"))
+                if rgb and max(rgb) < 0x60 and ch["text"].strip():
+                    dark[rgb] += 1
+                if not rgb or max(rgb) - min(rgb) < 60 or not ch["text"].strip():
+                    continue
+                b = boxes[-1] if boxes else None
+                if b and abs(b[1] - ch["top"]) < 1 and -1 < ch["x0"] - b[2] < 4:
+                    b[2], b[3] = ch["x1"], max(b[3], ch["bottom"])
+                else:
+                    boxes.append([ch["x0"], ch["top"], ch["x1"], ch["bottom"]])
+            pages.append([[round(v, 1) for v in b] for b in boxes])
+    data = {"boxes": pages, "ink": list(dark.most_common(1)[0][0]) if dark else [30, 30, 30]}
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def strip_publisher_ink(img: Image.Image, boxes: list, scale: float, ink: tuple = INK) -> None:
+    """Цветные буквы издателя становятся чёрными (только насыщенные пиксели в рамке слова)."""
+    for x0, t, x1, b in boxes:
+        box = (max(0, int(x0 * scale) - 1), max(0, int(t * scale) - 1),
+               min(img.width, int(x1 * scale) + 2), min(img.height, int(b * scale) + 2))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        region = img.crop(box)
+        hsv = region.convert("RGB").convert("HSV")
+        sat = hsv.getchannel("S").point(lambda v: 255 if v > 90 else 0)
+        val = hsv.getchannel("V").point(lambda v: 255 if v < 235 else 0)
+        mask = Image.composite(sat, Image.new("L", region.size, 0), val)
+        region.paste(Image.new("RGBA", region.size, tuple(ink) + (255,)), mask=mask)
+        img.paste(region, box[:2])
+
+
 def recolor_ink(img: Image.Image, box: tuple, color: tuple) -> None:
     """Перекрашивает буквы слова (тёмные пиксели) в color — как цвет шрифта в Word."""
     box = (max(0, box[0]), max(0, box[1]), min(img.width, box[2]), min(img.height, box[3]))
@@ -295,6 +357,8 @@ def render_page(src: pdfium.PdfDocument, pdf: dict, page_no: int, marks, recs, h
     target_h = CANVAS[1] - 2 * MARGIN
     scale = target_h / pinfo["h"]
     img = src[page_no - 1].render(scale=scale).to_pil().convert("RGBA")
+    if pdf.get("colored"):
+        strip_publisher_ink(img, pdf["colored"]["boxes"][page_no - 1], scale, tuple(pdf["colored"]["ink"]))
     over = Image.new("RGBA", img.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(over)
     words = pinfo["words"]
@@ -559,7 +623,7 @@ def cover_page(a, R, recs, n_pages_total: int) -> Image.Image:
 
 def write_pdf_report(a, R, out_path: Path, pdf_path: Path | None = None) -> Path:
     pdf_path = Path(pdf_path or config.SOURCE_PDF[a.grade])
-    pdf = load_pdf(pdf_path)
+    pdf = dict(load_pdf(pdf_path), colored=publisher_colors(pdf_path))
     recs = build_recommendations(a, R)
     marks = page_marks(a, R)
     notes = R.get("notes") or term_annotations(a)["by_start"]
@@ -708,7 +772,7 @@ def write_numbers_pdf(a, R, out_path: Path, pdf_path: Path | None = None) -> Pat
     """
     from textbook_report import grades_note
     pdf_path = Path(pdf_path or config.SOURCE_PDF[a.grade])
-    pdf = load_pdf(pdf_path)
+    pdf = dict(load_pdf(pdf_path), colored=publisher_colors(pdf_path))
     marks = page_marks(a, R)
     prior = R["prior"]
     bio_span = f"{prior.bio_grades[0]}–{prior.bio_grades[-1]}" if prior.bio_grades else "—"

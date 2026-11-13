@@ -1266,7 +1266,27 @@ NOTE_FONT_PT = 5            # размер чисел у термина
 # обычным шрифтом на полосе справа, текст страницы не меняется);
 # 'boxes' — мелкие плавающие надписи над и под термином
 NOTE_MODE = 'comments'
-NOTE_AUTHOR = 'Упоминания в прошлых классах'
+NOTE_AUTHOR = ''   # без подписи автора у примечаний
+
+
+NOTE_COMMENT_FONT = ("Arial Narrow", 8)
+
+
+def comment_style(doc) -> None:
+    """Компактный стиль текста примечаний (без него Word берёт крупный обычный стиль
+    учебника с отступами, и выноски не помещаются на полосе справа)."""
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+    s = next((x for x in doc.styles if x.style_id == "CommentText"), None)
+    if s is None:
+        s = doc.styles.add_style("annotation text", WD_STYLE_TYPE.PARAGRAPH)
+        s.element.set(qn("w:styleId"), "CommentText")
+    s.font.name, s.font.size = NOTE_COMMENT_FONT[0], Pt(NOTE_COMMENT_FONT[1])
+    pf = s.paragraph_format
+    pf.space_before = pf.space_after = Pt(0)
+    pf.line_spacing = 1.0
+    pf.first_line_indent = pf.left_indent = pf.right_indent = Pt(0)
 
 
 def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int]]) -> int:
@@ -1280,7 +1300,7 @@ def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int
         bounds.append((pos, pos + len(run.text), run))
         pos += len(run.text)
     done = 0
-    for off, sup, sub, end in notes:
+    for off, sup, sub, end, key in notes:
         start = off - 1
         runs = [r for a, b, r in bounds if a < b and a >= start and b <= end]
         if not runs:
@@ -1288,7 +1308,7 @@ def add_note_comments(paragraph: Paragraph, notes: list[tuple[int, str, str, int
             runs = [r for a, b, r in bounds if a <= start < b][:1]
         if not runs:
             continue
-        document.add_comment(runs=[runs[0], runs[-1]], text=f"био {sup} | все {sub}",
+        document.add_comment(runs=[runs[0], runs[-1]], text=f"{key}: био {sup} | все {sub}",
                              author=NOTE_AUTHOR, initials="")
         done += 1
     return done
@@ -1318,7 +1338,7 @@ def add_annotations(paragraph: Paragraph, notes: list[tuple[int, str, str, int]]
     if NOTE_MODE == 'comments':
         return add_note_comments(paragraph, notes)
     done = 0
-    for off, sup, sub, _ in sorted(notes, reverse=True):
+    for off, sup, sub, *_ in sorted(notes, reverse=True):
         pos = 0
         for run in list(paragraph.runs):
             r_start, r_end = pos, pos + len(run.text)
@@ -1431,6 +1451,45 @@ def _replace_run(run: Run, pieces: list[tuple[str, WD_COLOR_INDEX | None]]) -> N
             _apply_style(Run(new_el, run._parent), color)
 
     parent.remove(el)
+
+
+def _keep_color(val: str | None) -> bool:
+    """Цвет обычного текста: почти чёрный (231F20 и т. п.) или белый (надписи на плашках)."""
+    if not val or val.lower() == "auto" or len(val) != 6:
+        return True
+    try:
+        r, g, b = (int(val[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return True
+    return max(r, g, b) < 0x60 or min(r, g, b) > 0xE8
+
+
+def strip_publisher_colors(doc) -> int:
+    """Снимает цветное выделение издателя (фиолетовые, зелёные, синие слова), чтобы
+    в тексте остались только наши цвета: текст становится чёрным, белый не трогается."""
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    roots = [doc.element.body, doc.styles.element]
+    done = 0
+    # цвет обычного текста учебника (в 10 классе 231F20, в 11-м чёрный) — им и заменяем
+    from collections import Counter
+    dark = Counter()
+    for el in doc.element.body.iter(w + "color"):
+        v = el.get(w + "val") or ""
+        if len(v) == 6 and v.lower() != "auto" and max(int(v[i:i + 2], 16) for i in (0, 2, 4)) < 0x60:
+            dark[v.upper()] += 1
+    body = dark.most_common(1)[0][0] if dark else "000000"
+    for root in roots:
+        for el in list(root.iter(w + "color")):
+            if _keep_color(el.get(w + "val")):
+                continue
+            el.set(w + "val", body)
+            for attr in ("themeColor", "themeTint", "themeShade"):
+                el.attrib.pop(w + attr, None)
+            done += 1
+        for el in list(root.iter(w + "highlight")):
+            el.getparent().remove(el)
+            done += 1
+    return done
 
 
 def _apply_style(run: Run, style) -> None:
@@ -1644,6 +1703,7 @@ def highlight_textbook(
     patterns_total = sum(len(v) for v in patterns_by_len.values())
 
     doc = Document(str(in_path))
+    print(f"[Цвет издателя] снято с фрагментов: {strip_publisher_colors(doc)}")
     a = analyze_document(
         doc, preprocessor, prev, patterns_by_len, verb_shadowed, not_new,
         include_propn=include_propn, term_sources=term_sources,
@@ -1672,6 +1732,8 @@ def highlight_textbook(
     for pi, spans in colored_by_para.items():
         painted += apply_colors_to_paragraph(paragraphs[pi], sorted(spans, key=lambda x: x[0]))
     noted = 0
+    if NOTE_MODE == 'comments':
+        comment_style(doc)
     for pi, items in notes["by_para"].items():
         noted += add_annotations(paragraphs[pi], items)
     print(f"[Пометки] Чисел упоминаний у терминов: {noted}")
@@ -1895,7 +1957,8 @@ def write_legend(out_path: str | Path, grade: int, base_descr: str, min_freq: in
         p = doc.add_paragraph()
         p.add_run("Где смотреть числа. ").bold = True
         p.add_run("В учебнике Word числа стоят в примечаниях: у каждого термина при первом его появлении на "
-                  "каждой странице (вкладка «Рецензирование» → «Показать примечания» или область примечаний). "
+                  "каждой странице (повторы на той же странице без примечаний); соседние термины собраны в одну "
+                  "выноску, по строке на термин (вкладка «Рецензирование» → «Показать примечания» или область примечаний). "
                   "Примечания не занимают места в тексте, поэтому страницы совпадают с исходным учебником. "
                   "Для чтения и печати есть отдельный файл «…числа_у_терминов….pdf»: слева страница учебника, "
                   "справа — все термины этой страницы с числами.")

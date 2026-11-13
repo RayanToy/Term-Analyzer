@@ -68,9 +68,11 @@ def main(paths: list[str]) -> None:
     # «~$…docx» — служебные файлы блокировки открытых в Word документов
     docs = [Path(p).resolve() for p in paths if not Path(p).name.startswith("~$")]
     import tempfile
+    import comment_pages
     import note_layout
     with tempfile.TemporaryDirectory() as tmp:
         for d in docs:
+            comment_pages.dedupe(d, Path(tmp))
             note_layout.layout(d, Path(tmp))
     export_pdf(docs)
     for d in docs:

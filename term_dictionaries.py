@@ -26,7 +26,7 @@ SOURCES = ("frp", "index", "dict")          # по старшинству
 SOURCE_NAMES = {"frp": "ФРП", "index": "указатель учебника", "dict": "словарь терминов"}
 # Термин выделяется цветом шрифта (не заливкой): серый, зелёный, жёлтый
 # (тёмно-жёлтый — светлый жёлтый на белом не читается)
-FONT_COLOR = {"frp": "7F7F7F", "index": "00A04A", "dict": "C49A00"}
+FONT_COLOR = {"frp": "8C99A6", "index": "00A04A", "dict": "C49A00"}
 COLOR_NAMES = {"frp": "серый", "index": "зелёный", "dict": "жёлтый"}
 UNDERLINE_COLOR = FONT_COLOR
 NEW_WORD_COLOR = "00A3B8"        # новые слова — бирюзовый

@@ -1063,7 +1063,6 @@ def term_annotations(a, use_cache: bool = True, every: bool = False) -> dict:
     grade_counts = corpus.counts(multi) if multi else {}
     prior = PriorMentions(a.grade, a.preprocessor, a.patterns_by_len, a.verb_shadowed, use_cache)
     by_para, by_start = defaultdict(list), {}
-    seen_on_page = set()
     for key, lst in occ.items():
         m = prior.of(key, True, corpus_grades=grade_counts.get(key, {}).get("grade"))
         sup, sub = grades_note(m["bio"]), grades_note(m["all"])
@@ -1074,16 +1073,14 @@ def term_annotations(a, use_cache: bool = True, every: bool = False) -> dict:
             if inside_longer(s, e) or (page and page > last_section_page):
                 continue
             first = last_page is None or (page and page - last_page >= FAR_PAGES)
-            # every: одно примечание на термин на каждой странице — повторы на той же
-            # странице не дублируются, иначе примечания не помещаются на полосе
-            new_on_page = (page, key) not in seen_on_page
-            seen_on_page.add((page, key))
-            if (every and (new_on_page or page is None)) or first:
+            # every: пометка у каждого вхождения; повторы на одной странице Word
+            # убирает comment_pages (страницы знает только Word)
+            if every or first:
                 # Пометка привязывается к первой букве термина; конец — в том же абзаце
                 rng = a.stream.to_paragraphs(s, e)
                 if rng and not in_box(rng[0][0]):
                     pi, ps, pe = rng[0]
-                    by_para[pi].append((ps + 1, sup, sub, pe))
+                    by_para[pi].append((ps + 1, sup, sub, pe, key))
                     if first:
                         by_start[s] = (key, sup, sub)
             if page:
