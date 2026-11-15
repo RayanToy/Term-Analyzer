@@ -67,6 +67,8 @@ WINDOW = 5
 TOP_SHIFT = 20
 TOP_CHECK = 100
 COMMON_PRIOR = 400     # подсказка «возможно, общеупотребительное»
+TERM_MIN_FREQ = 3      # вкладки «Обогащ. N — словарь»: термины с частотой от 3 включительно
+TERM_SHEET = {"frp": "ФРП", "index": "указатель", "dict": "словарь терминов"}
 LL_CRIT = ((15.13, "p < 0,0001"), (10.83, "p < 0,001"), (6.63, "p < 0,01"), (3.84, "p < 0,05"))
 
 # Вводные слова (исключаются как служебные, этап 2)
@@ -617,6 +619,29 @@ def main() -> None:
     sheets["Выбывшие 10 (V10∖V11)"] = pd.DataFrame(unit_rows(S[10] - S[11], 10, other(11)),
                                                   columns=base_cols + ["Встречается в 11 кл. (раз, вне V11)"])
 
+    # Термины из вкладок обогащения — отдельно по каждому словарю класса, частота ≥ TERM_MIN_FREQ
+    term_sheets = {}
+    for g, prev in ((10, 9), (11, 10)):
+        enrich = f"Обогащение {g} (V{g}∖V{prev})"
+        lists = td.term_lists(g, morph)
+        for src in (s for s in td.SOURCES if s in lists):
+            of_pattern: dict[str, list[str]] = defaultdict(list)
+            for term in lists[src]:
+                lemmas, pattern = normalize_term_to_pattern(term, pre)
+                if lemmas and term.lower() not in map(str.lower, of_pattern[pattern.lower()]):
+                    of_pattern[pattern.lower()].append(term)
+            keys = [k for k in S[g] - S[prev] if k.lower() in of_pattern and V[g]["freq"].get(k, 0) >= TERM_MIN_FREQ]
+            # unit_rows сортирует так же, поэтому строки идут в порядке ordered
+            ordered = sorted(keys, key=lambda x: (-V[g]["freq"].get(x, 0), x))
+            rows = [["; ".join(of_pattern[k.lower()])] + r for k, r in zip(ordered, unit_rows(keys, g, other(prev)))]
+            term_sheets.setdefault(enrich, []).append((
+                f"Обогащ. {g} — {TERM_SHEET[src]}",
+                pd.DataFrame([r[:7] + r[8:] for r in rows],
+                             columns=["Термин в словаре"] + base_cols[:-1]
+                             + [f"Встречается в {prev} кл. (раз, вне V{prev})"])))
+    sheets = {name: df for key, df in sheets.items()
+              for name, df in [(key, df)] + term_sheets.get(key, [])}
+
     # Словосочетания (этап 3)
     rows = []
     for g in GRADES:
@@ -738,7 +763,12 @@ def main() -> None:
                                 f"знаменательные соседи в окне ±{WINDOW} слов внутри предложения в каждом учебнике. "
                                 f"Сходство окружения — косинус векторов частот соседей (1 — окружение то же); "
                                 f"сдвиг = 1 − сходство. Показаны топ-10 соседей и новые соседи 11 кл."],
-        ["Проверка топ-100", f"По 100 самых частых единиц обогащения 10 и 11 кл. для экспертной проверки. "
+        ["Обогащ. 10 / 11 — ФРП, указатель, словарь терминов",
+         f"Единицы вкладки «Обогащение 10 (V10∖V9)» или «Обогащение 11 (V11∖V10)», которые есть в одном словаре "
+         f"класса: термины ФРП, предметный указатель учебника, словарь терминов — по вкладке на словарь. Отобраны "
+         f"встречающиеся в учебнике {TERM_MIN_FREQ} раза и больше. «Термин в словаре» — как записан в словаре; "
+         f"сравнение по леммам."],
+        ["Проверка топ-100",f"По 100 самых частых единиц обогащения 10 и 11 кл. для экспертной проверки. "
                              "«Возможно, общеупотребительное» — слово не из словарей терминов, которое в школьных "
                              f"учебниках всех предметов прошлых классов встречалось {COMMON_PRIOR} раз и больше. Столбец "
                              "«Решение эксперта» заполняется вручную (выбор из списка)."],
